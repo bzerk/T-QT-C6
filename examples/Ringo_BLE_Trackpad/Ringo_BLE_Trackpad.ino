@@ -18,6 +18,7 @@ constexpr uint8_t kMouseReportId = 0x01;
 
 constexpr uint32_t kDisplayRefreshMs = 140;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
+constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kImuPollMs = 8;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 
@@ -49,6 +50,7 @@ bool g_touchActive = false;
 bool g_imuReady = false;
 
 uint32_t g_lastTouchEventMs = 0;
+uint32_t g_lastTouchPollMs = 0;
 uint32_t g_lastImuPollMs = 0;
 uint32_t g_lastImuDebugMs = 0;
 uint32_t g_lastImuSampleUs = 0;
@@ -94,6 +96,7 @@ bool g_touchLongActionFired = false;
 uint32_t g_touchDownStartMs = 0;
 int16_t g_touchDownX = -1;
 int16_t g_touchDownY = -1;
+bool g_swipeHandledThisTouch = false;
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -199,12 +202,12 @@ void setLeftLock(bool enable) {
   g_leftLockActive = enable;
   if (enable) {
     setButtonMask(g_buttonMask | 0x01);
-    g_clickMode = "L-LOCK";
-    Serial.println("[touch] left lock ON");
+    g_clickMode = "DRAG";
+    Serial.println("[touch] drag hold ON");
   } else {
     setButtonMask(g_buttonMask & static_cast<uint8_t>(~0x01));
-    g_clickMode = "FREE";
-    Serial.println("[touch] left lock OFF");
+    g_clickMode = g_tapArmed ? "TAP-ARM" : "FREE";
+    Serial.println("[touch] drag hold OFF");
   }
 }
 
@@ -216,11 +219,10 @@ void armTapWindow() {
 
 void onTapReleased() {
   if (g_leftLockActive) {
-    g_tapArmed = false;
-    setLeftLock(false);
     return;
   }
 
+  g_clickMode = "L-CLICK";
   sendLeftClick();
   armTapWindow();
 }
@@ -533,9 +535,11 @@ void handleGestureIfAny() {
 
   if (gesture == "Swipe Up") {
     g_tapArmed = false;
+    g_swipeHandledThisTouch = true;
     sendMouseReport(g_buttonMask, 0, 0, 1);
   } else if (gesture == "Swipe Down") {
     g_tapArmed = false;
+    g_swipeHandledThisTouch = true;
     sendMouseReport(g_buttonMask, 0, 0, -1);
   }
 }
@@ -547,6 +551,12 @@ void sampleTouchState() {
 
   if (finger <= 0) {
     if (g_touchDown) {
+      if (g_leftLockActive) {
+        g_tapArmed = false;
+        setLeftLock(false);
+        g_lastGesture = "Drag Release";
+      }
+
       const uint32_t pressDuration = now - g_touchDownStartMs;
       const int16_t deltaX = g_touchX - g_touchDownX;
       const int16_t deltaY = g_touchY - g_touchDownY;
@@ -554,7 +564,9 @@ void sampleTouchState() {
       const int16_t absDy = abs(deltaY);
 
       bool handledOnRelease = false;
-      if (!g_touchLongActionFired && pressDuration <= kTouchSwipeMaxDurationMs &&
+      if (!g_swipeHandledThisTouch &&
+          !g_touchLongActionFired &&
+          pressDuration <= kTouchSwipeMaxDurationMs &&
           absDy >= kTouchSwipeMinDistancePx && absDy > (absDx + 8)) {
         const int8_t wheelStep = (deltaY < 0) ? 1 : -1;
         uint8_t steps = static_cast<uint8_t>(std::min<int16_t>(3, std::max<int16_t>(1, absDy / 28)));
@@ -578,6 +590,7 @@ void sampleTouchState() {
 
     g_touchDown = false;
     g_touchLongActionFired = false;
+    g_swipeHandledThisTouch = false;
     g_touchActive = false;
     return;
   }
@@ -594,6 +607,7 @@ void sampleTouchState() {
   g_touchActive = true;
   g_touchX = x;
   g_touchY = y;
+  g_lastTouchEventMs = now;
 
   if (!g_touchDown) {
     g_touchDown = true;
@@ -601,6 +615,7 @@ void sampleTouchState() {
     g_touchDownStartMs = now;
     g_touchDownX = x;
     g_touchDownY = y;
+    g_swipeHandledThisTouch = false;
     return;
   }
 
@@ -614,14 +629,15 @@ void sampleTouchState() {
       if (g_tapArmed && static_cast<int32_t>(g_tapArmDeadlineMs - now) >= 0 && !g_leftLockActive) {
         g_tapArmed = false;
         setLeftLock(true);
+        g_lastGesture = "Drag Hold";
       } else if (!g_leftLockActive) {
         g_tapArmed = false;
         g_clickMode = "R-CLICK";
         sendRightClick();
         g_clickMode = "FREE";
+        g_lastGesture = "Long Press";
       }
       g_touchLongActionFired = true;
-      g_lastGesture = "Long Press";
     }
   }
 }
@@ -759,8 +775,12 @@ void loop() {
   if (g_touchInterrupt) {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
-    sampleTouchState();
     handleGestureIfAny();
+  }
+
+  if ((now - g_lastTouchPollMs) >= kTouchPollMs) {
+    g_lastTouchPollMs = now;
+    sampleTouchState();
   }
 
   if (g_touchActive && (now - g_lastTouchEventMs) > kTouchReleaseTimeoutMs) {
