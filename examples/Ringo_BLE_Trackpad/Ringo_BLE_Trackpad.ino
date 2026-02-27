@@ -40,7 +40,6 @@ constexpr int16_t kTouchTapMoveThresholdPx = 12;
 constexpr int16_t kTouchSwipeMinDistancePx = 24;
 constexpr float kRollRateDampStartDps = 45.0f;
 constexpr float kRollRateSuppressDps = 140.0f;
-constexpr float kRollCounterRateDps = 170.0f;
 constexpr int kYawSign = -1;
 constexpr int kPitchSign = 1;
 
@@ -657,42 +656,10 @@ void updateAirMouse() {
   float rx = (kForwardY * g_gravityZ) - (kForwardZ * g_gravityY);
   float ry = (kForwardZ * g_gravityX) - (kForwardX * g_gravityZ);
   float rz = (kForwardX * g_gravityY) - (kForwardY * g_gravityX);
-  const float candidateRef[3][3] = {
-      {1.0f, 0.0f, 0.0f},
-      {0.0f, 1.0f, 0.0f},
-      {0.0f, 0.0f, 1.0f},
-  };
-  float bestRx = rx;
-  float bestRy = ry;
-  float bestRz = rz;
-  float bestNorm = sqrtf((rx * rx) + (ry * ry) + (rz * rz));
-  for (uint8_t i = 0; i < 3; ++i) {
-    const float cx = (candidateRef[i][1] * g_gravityZ) - (candidateRef[i][2] * g_gravityY);
-    const float cy = (candidateRef[i][2] * g_gravityX) - (candidateRef[i][0] * g_gravityZ);
-    const float cz = (candidateRef[i][0] * g_gravityY) - (candidateRef[i][1] * g_gravityX);
-    const float cn = sqrtf((cx * cx) + (cy * cy) + (cz * cz));
-    if (cn > bestNorm) {
-      bestNorm = cn;
-      bestRx = cx;
-      bestRy = cy;
-      bestRz = cz;
-    }
-  }
-
-  if (bestNorm > 0.15f) {
-    bestRx /= bestNorm;
-    bestRy /= bestNorm;
-    bestRz /= bestNorm;
-    const float continuity = (bestRx * g_rightX) + (bestRy * g_rightY) + (bestRz * g_rightZ);
-    if (continuity < 0.0f) {
-      bestRx = -bestRx;
-      bestRy = -bestRy;
-      bestRz = -bestRz;
-    }
-
-    g_rightX = ((1.0f - kRightAxisLpfAlpha) * g_rightX) + (kRightAxisLpfAlpha * bestRx);
-    g_rightY = ((1.0f - kRightAxisLpfAlpha) * g_rightY) + (kRightAxisLpfAlpha * bestRy);
-    g_rightZ = ((1.0f - kRightAxisLpfAlpha) * g_rightZ) + (kRightAxisLpfAlpha * bestRz);
+  if (normalize3(rx, ry, rz)) {
+    g_rightX = ((1.0f - kRightAxisLpfAlpha) * g_rightX) + (kRightAxisLpfAlpha * rx);
+    g_rightY = ((1.0f - kRightAxisLpfAlpha) * g_rightY) + (kRightAxisLpfAlpha * ry);
+    g_rightZ = ((1.0f - kRightAxisLpfAlpha) * g_rightZ) + (kRightAxisLpfAlpha * rz);
     normalize3(g_rightX, g_rightY, g_rightZ);
   }
 
@@ -729,13 +696,10 @@ void updateAirMouse() {
     rollDamp = 1.0f - t;
     rollDamp *= rollDamp;
   }
-  const float activityCounter = std::min(1.0f, rateMag / kRollCounterRateDps);
-  const float counterBoost = activityCounter * activityCounter;
-  const float effectiveRollDamp = rollDamp + ((1.0f - rollDamp) * counterBoost);
-  g_rollDamp = effectiveRollDamp;
+  g_rollDamp = rollDamp;
 
-  const float targetVelX = static_cast<float>(kYawSign) * yawRate * kAirMouseYawGain * accel * effectiveRollDamp;
-  const float targetVelY = static_cast<float>(kPitchSign) * pitchRate * kAirMousePitchGain * accel * effectiveRollDamp;
+  const float targetVelX = static_cast<float>(kYawSign) * yawRate * kAirMouseYawGain * accel * rollDamp;
+  const float targetVelY = static_cast<float>(kPitchSign) * pitchRate * kAirMousePitchGain * accel * rollDamp;
 
   g_airVelX = ((1.0f - kVelocityLpfAlpha) * g_airVelX) + (kVelocityLpfAlpha * targetVelX);
   g_airVelY = ((1.0f - kVelocityLpfAlpha) * g_airVelY) + (kVelocityLpfAlpha * targetVelY);
