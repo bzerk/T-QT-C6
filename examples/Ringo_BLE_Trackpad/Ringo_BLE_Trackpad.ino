@@ -771,14 +771,17 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+  bool touchEdge = false;
 
   if (g_touchInterrupt) {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
+    touchEdge = true;
     handleGestureIfAny();
   }
 
-  if ((now - g_lastTouchPollMs) >= kTouchPollMs) {
+  const bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
+  if (touchNeedsPolling && (now - g_lastTouchPollMs) >= kTouchPollMs) {
     g_lastTouchPollMs = now;
     sampleTouchState();
   }
