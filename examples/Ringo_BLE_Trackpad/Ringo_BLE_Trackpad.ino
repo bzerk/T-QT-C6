@@ -32,7 +32,8 @@ constexpr uint32_t kGraffitiTapMaxDurationMs = 320;
 constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
 constexpr int16_t kModeExitTapSeparationPx = 42;
 constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
-constexpr float kModeFlipSignThreshold = -0.30f;
+constexpr uint8_t kGraffitiInvertAxis = 1;  // Device Y axis
+constexpr float kGraffitiInvertThreshold = -0.30f;
 constexpr uint32_t kGraffitiExitSwipeMaxDurationMs = 900;
 constexpr int16_t kGraffitiExitSwipeMinDyPx = 24;
 constexpr int16_t kGraffitiExitSwipeMaxDxPx = 40;
@@ -359,7 +360,7 @@ bool isModeFlipInverted() {
   }
 
   const float projection = gravityAxisValue(g_modeFlipRefAxis) * g_modeFlipRefSign;
-  return projection <= kModeFlipSignThreshold;
+  return projection <= kGraffitiInvertThreshold;
 }
 
 float modeFlipProjection() {
@@ -367,6 +368,14 @@ float modeFlipProjection() {
     return 1.0f;
   }
   return gravityAxisValue(g_modeFlipRefAxis) * g_modeFlipRefSign;
+}
+
+bool isGraffitiUpsideDown() {
+  return gravityAxisValue(kGraffitiInvertAxis) <= kGraffitiInvertThreshold;
+}
+
+float graffitiInvertProjection() {
+  return gravityAxisValue(kGraffitiInvertAxis);
 }
 
 void resetInputTransientState() {
@@ -593,34 +602,47 @@ bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t d
 
 void sampleGraffitiTouchState() {
   const uint32_t now = millis();
+  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
   const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+  const bool hasFinger = (finger > 0);
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
-  const bool touchPresent = coordValid && !coordIdle;
+  const bool coordTouch = coordValid && !coordIdle;
+  const bool touchPresentRaw = hasFinger || coordTouch;
 
-  if (touchPresent) {
+  if (coordTouch) {
     g_touchActive = true;
     g_touchX = x;
     g_touchY = y;
     g_lastTouchEventMs = now;
     g_graffitiLastCoordMs = now;
+  }
+
+  if (touchPresentRaw) {
+    g_touchActive = true;
     g_graffitiNoFingerSamples = 0;
 
     if (!g_touchDown) {
+      if (!coordTouch) {
+        return;
+      }
       resetGraffitiStrokeState();
       g_touchDown = true;
       g_graffitiStatus = "DRAW";
       g_graffitiTouchStartMs = now;
       g_touchDownStartMs = now;
-      g_touchDownX = x;
-      g_touchDownY = y;
+      g_touchDownX = g_touchX;
+      g_touchDownY = g_touchY;
       g_graffitiLastCoordMs = now;
     }
 
-    graffitiAddPoint(g_touchX, g_touchY);
+    if (coordTouch) {
+      graffitiAddPoint(g_touchX, g_touchY);
+    }
     if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
       g_touchDown = false;
       g_touchActive = false;
@@ -646,7 +668,7 @@ void sampleGraffitiTouchState() {
   const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
                         absDx <= kGraffitiTapMoveThresholdPx &&
                         absDy <= kGraffitiTapMoveThresholdPx);
-  const bool inverted = isModeFlipInverted();
+  const bool inverted = isGraffitiUpsideDown();
   g_graffitiLastDeltaX = deltaX;
   g_graffitiLastDeltaY = deltaY;
   g_graffitiLastPressMs = static_cast<uint16_t>(std::min<uint32_t>(65535, pressDuration));
@@ -979,7 +1001,7 @@ void renderStatus(bool force) {
     snprintf(buf, sizeof(buf), "Gra:%s n%u l%u", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
              g_graffitiLastStrokePoints);
     drawStatusLine(6, 94, String(buf), WHITE, force);
-    snprintf(buf, sizeof(buf), "I:%c %.2f M:%s", isModeFlipInverted() ? 'Y' : 'N', modeFlipProjection(),
+    snprintf(buf, sizeof(buf), "I:%c %.2f M:%s", isGraffitiUpsideDown() ? 'Y' : 'N', graffitiInvertProjection(),
              g_graffitiLastMatch.c_str());
     drawStatusLine(7, 104, String(buf), GREEN, force);
     drawStatusLine(8, 114, String("T:") + textTail(g_graffitiText, 7) + " U+2Tap->Mouse", YELLOW, force);
@@ -1270,7 +1292,9 @@ void loop() {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
     touchEdge = true;
-    handleGestureIfAny();
+    if (g_inputMode == InputMode::Mouse) {
+      handleGestureIfAny();
+    }
   }
 
   bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
