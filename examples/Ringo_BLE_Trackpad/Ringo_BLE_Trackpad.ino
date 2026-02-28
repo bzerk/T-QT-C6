@@ -33,6 +33,9 @@ constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
 constexpr int16_t kModeExitTapSeparationPx = 42;
 constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
 constexpr float kModeFlipSignThreshold = -0.30f;
+constexpr uint32_t kGraffitiExitSwipeMaxDurationMs = 520;
+constexpr int16_t kGraffitiExitSwipeMinDyPx = 36;
+constexpr int16_t kGraffitiExitSwipeMaxDxPx = 22;
 constexpr uint32_t kGraffitiIdleTouchPollMs = 40;
 constexpr uint8_t kGraffitiReleaseDebounceSamples = 5;
 constexpr uint32_t kGraffitiCoordGapGraceMs = 64;
@@ -303,7 +306,6 @@ void resetGraffitiStrokeState() {
   g_graffitiStrokeCount = 0;
   g_graffitiTouchStartMs = 0;
   g_graffitiNoFingerSamples = 0;
-  g_graffitiLastCoordMs = 0;
 }
 
 void resetGraffitiTapSwitchState() {
@@ -568,107 +570,123 @@ void finalizeGraffitiStroke() {
   resetGraffitiStrokeState();
 }
 
+bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t deltaY, uint16_t pointCount) {
+  if (pointCount < 3) {
+    return false;
+  }
+  if (pressDurationMs > kGraffitiExitSwipeMaxDurationMs) {
+    return false;
+  }
+  if (deltaY < kGraffitiExitSwipeMinDyPx) {
+    return false;
+  }
+  if (abs(deltaX) > kGraffitiExitSwipeMaxDxPx) {
+    return false;
+  }
+  return true;
+}
+
 void sampleGraffitiTouchState() {
   const uint32_t now = millis();
-  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
   const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
-  const bool coordUsable = coordValid && !coordIdle;
-  const bool touchPresent = (finger > 0) || coordUsable;
+  const bool touchPresent = coordValid && !coordIdle;
 
-  if (!touchPresent) {
-    if (g_touchDown) {
-      g_graffitiNoFingerSamples++;
-      if (g_graffitiLastCoordMs != 0 &&
-          (now - g_graffitiLastCoordMs) <= kGraffitiCoordGapGraceMs) {
-        return;
-      }
-      if (g_graffitiNoFingerSamples < kGraffitiReleaseDebounceSamples) {
-        return;
-      }
-
-      const uint32_t pressDuration = now - g_touchDownStartMs;
-      const int16_t absDx = abs(g_touchX - g_touchDownX);
-      const int16_t absDy = abs(g_touchY - g_touchDownY);
-      const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
-                            absDx <= kGraffitiTapMoveThresholdPx &&
-                            absDy <= kGraffitiTapMoveThresholdPx);
-      const bool inverted = isModeFlipInverted();
-      bool handled = false;
-
-      if (tapLike && inverted) {
-        if (g_graffitiTapArmed &&
-            (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
-          const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
-          const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
-          if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
-            g_graffitiStatus = "MODE->MOUSE";
-            resetGraffitiTapSwitchState();
-            g_touchDown = false;
-            g_touchActive = false;
-            setInputMode(InputMode::Mouse);
-            return;
-          }
-        }
-
-        g_graffitiTapArmed = true;
-        g_graffitiTapArmedMs = now;
-        g_graffitiTapAnchorX = g_touchDownX;
-        g_graffitiTapAnchorY = g_touchDownY;
-        g_graffitiStatus = "EXIT TAP1";
-        resetGraffitiStrokeState();
-        handled = true;
-      } else if (tapLike && !inverted) {
-        // Avoid stale armed exit taps when orientation is upright.
-        resetGraffitiTapSwitchState();
-      }
-
-      g_touchDown = false;
-      g_touchActive = false;
-      if (!handled) {
-        finalizeGraffitiStroke();
-      }
-    }
-    return;
-  }
-  g_graffitiNoFingerSamples = 0;
-
-  if (coordUsable) {
+  if (touchPresent) {
+    g_touchActive = true;
     g_touchX = x;
     g_touchY = y;
     g_lastTouchEventMs = now;
     g_graffitiLastCoordMs = now;
-  } else if (g_touchX < 0 || g_touchY < 0) {
+    g_graffitiNoFingerSamples = 0;
+
+    if (!g_touchDown) {
+      g_touchDown = true;
+      g_graffitiStatus = "DRAW";
+      g_graffitiTouchStartMs = now;
+      g_touchDownStartMs = now;
+      g_touchDownX = x;
+      g_touchDownY = y;
+      resetGraffitiStrokeState();
+      g_graffitiLastCoordMs = now;
+    }
+
+    graffitiAddPoint(g_touchX, g_touchY);
+    if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
+      g_touchDown = false;
+      g_touchActive = false;
+      g_graffitiStatus = "TIMEOUT";
+      finalizeGraffitiStroke();
+    }
     return;
   }
-  g_touchActive = true;
-
   if (!g_touchDown) {
-    if (!coordUsable) {
-      return;
-    }
-    g_touchDown = true;
-    g_graffitiStatus = "DRAW";
-    g_graffitiTouchStartMs = now;
-    g_touchDownStartMs = now;
-    g_touchDownX = g_touchX;
-    g_touchDownY = g_touchY;
-    resetGraffitiStrokeState();
+    return;
   }
 
-  if (coordUsable) {
-    graffitiAddPoint(g_touchX, g_touchY);
+  g_graffitiNoFingerSamples++;
+  if (g_graffitiLastCoordMs != 0 &&
+      (now - g_graffitiLastCoordMs) <= kGraffitiCoordGapGraceMs) {
+    return;
   }
-  if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
-    g_touchDown = false;
-    g_touchActive = false;
-    g_graffitiStatus = "TIMEOUT";
+  if (g_graffitiNoFingerSamples < kGraffitiReleaseDebounceSamples) {
+    return;
+  }
+
+  const uint32_t pressDuration = now - g_touchDownStartMs;
+  const int16_t deltaX = g_touchX - g_touchDownX;
+  const int16_t deltaY = g_touchY - g_touchDownY;
+  const int16_t absDx = abs(deltaX);
+  const int16_t absDy = abs(deltaY);
+  const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
+                        absDx <= kGraffitiTapMoveThresholdPx &&
+                        absDy <= kGraffitiTapMoveThresholdPx);
+  const bool inverted = isModeFlipInverted();
+
+  g_touchDown = false;
+  g_touchActive = false;
+
+  if (!inverted && isGraffitiSwipeDownExit(pressDuration, deltaX, deltaY, g_graffitiStrokeCount)) {
+    g_graffitiStatus = "MODE->MOUSE";
+    resetGraffitiTapSwitchState();
+    setInputMode(InputMode::Mouse);
+    return;
+  }
+
+  if (tapLike && inverted) {
+    if (g_graffitiTapArmed &&
+        (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
+      const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
+      const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
+      if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
+        g_graffitiStatus = "MODE->MOUSE";
+        resetGraffitiTapSwitchState();
+        setInputMode(InputMode::Mouse);
+        return;
+      }
+    }
+
+    g_graffitiTapArmed = true;
+    g_graffitiTapArmedMs = now;
+    g_graffitiTapAnchorX = g_touchDownX;
+    g_graffitiTapAnchorY = g_touchDownY;
+    g_graffitiStatus = "EXIT TAP1";
+    resetGraffitiStrokeState();
+    return;
+  }
+
+  if (tapLike && !inverted) {
+    resetGraffitiTapSwitchState();
+  }
+
+  if (g_graffitiStrokeCount > 0) {
     finalizeGraffitiStroke();
+  } else {
+    g_graffitiStatus = "READY";
   }
 }
 
@@ -988,27 +1006,8 @@ void handleGestureIfAny() {
     return;
   }
 
-  if (gesture == "Single Click" || gesture == "Double Click") {
-    if (!isModeFlipInverted()) {
-      resetGraffitiTapSwitchState();
-      return;
-    }
-
-    const uint32_t now = millis();
-    if (g_graffitiTapArmed &&
-        (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
-      g_graffitiStatus = "MODE->MOUSE";
-      resetGraffitiTapSwitchState();
-      setInputMode(InputMode::Mouse);
-      return;
-    }
-
-    g_graffitiTapArmed = true;
-    g_graffitiTapArmedMs = now;
-    g_graffitiStatus = "EXIT TAP1";
-    return;
-  }
-
+  // Graffiti mode uses raw coordinate state machine for stroke and mode exits.
+  return;
 }
 
 void sampleTouchState() {
