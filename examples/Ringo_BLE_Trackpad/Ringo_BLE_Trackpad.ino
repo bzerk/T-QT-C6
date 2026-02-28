@@ -20,20 +20,22 @@ constexpr uint8_t kMouseReportId = 0x01;
 constexpr uint32_t kDisplayRefreshMs = 140;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
+constexpr uint32_t kGraffitiTouchPollMs = 8;
 constexpr uint32_t kImuPollMs = 8;
 constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
 constexpr uint16_t kGraffitiStrokeMinPoints = 4;
 constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
-constexpr int32_t kGraffitiMinPointDistanceSq = 4;
+constexpr int32_t kGraffitiMinPointDistanceSq = 1;
 constexpr uint32_t kGraffitiTapMaxDurationMs = 320;
 constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
 constexpr int16_t kModeExitTapSeparationPx = 42;
 constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
 constexpr float kModeFlipSignThreshold = -0.30f;
 constexpr uint32_t kGraffitiIdleTouchPollMs = 40;
-constexpr uint8_t kGraffitiReleaseDebounceSamples = 2;
+constexpr uint8_t kGraffitiReleaseDebounceSamples = 5;
+constexpr uint32_t kGraffitiCoordGapGraceMs = 64;
 constexpr int16_t kCstIdleX = 60;
 constexpr int16_t kCstIdleY = 150;
 constexpr bool kTouchGestureYInverted = true;
@@ -136,6 +138,7 @@ bool g_graffitiTapArmed = false;
 int16_t g_graffitiTapAnchorX = -1;
 int16_t g_graffitiTapAnchorY = -1;
 uint8_t g_graffitiNoFingerSamples = 0;
+uint32_t g_graffitiLastCoordMs = 0;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -300,6 +303,7 @@ void resetGraffitiStrokeState() {
   g_graffitiStrokeCount = 0;
   g_graffitiTouchStartMs = 0;
   g_graffitiNoFingerSamples = 0;
+  g_graffitiLastCoordMs = 0;
 }
 
 void resetGraffitiTapSwitchState() {
@@ -574,11 +578,16 @@ void sampleGraffitiTouchState() {
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
-  const bool touchPresent = (finger > 0) || (coordValid && !coordIdle);
+  const bool coordUsable = coordValid && !coordIdle;
+  const bool touchPresent = (finger > 0) || coordUsable;
 
   if (!touchPresent) {
     if (g_touchDown) {
       g_graffitiNoFingerSamples++;
+      if (g_graffitiLastCoordMs != 0 &&
+          (now - g_graffitiLastCoordMs) <= kGraffitiCoordGapGraceMs) {
+        return;
+      }
       if (g_graffitiNoFingerSamples < kGraffitiReleaseDebounceSamples) {
         return;
       }
@@ -629,22 +638,32 @@ void sampleGraffitiTouchState() {
   }
   g_graffitiNoFingerSamples = 0;
 
+  if (coordUsable) {
+    g_touchX = x;
+    g_touchY = y;
+    g_lastTouchEventMs = now;
+    g_graffitiLastCoordMs = now;
+  } else if (g_touchX < 0 || g_touchY < 0) {
+    return;
+  }
   g_touchActive = true;
-  g_touchX = x;
-  g_touchY = y;
-  g_lastTouchEventMs = now;
 
   if (!g_touchDown) {
+    if (!coordUsable) {
+      return;
+    }
     g_touchDown = true;
     g_graffitiStatus = "DRAW";
     g_graffitiTouchStartMs = now;
     g_touchDownStartMs = now;
-    g_touchDownX = x;
-    g_touchDownY = y;
+    g_touchDownX = g_touchX;
+    g_touchDownY = g_touchY;
     resetGraffitiStrokeState();
   }
 
-  graffitiAddPoint(x, y);
+  if (coordUsable) {
+    graffitiAddPoint(g_touchX, g_touchY);
+  }
   if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
     g_touchDown = false;
     g_touchActive = false;
@@ -990,12 +1009,6 @@ void handleGestureIfAny() {
     return;
   }
 
-  // Recovery path so mode switching never gets stuck.
-  if (gesture == "Swipe Down") {
-    g_graffitiStatus = "MODE->MOUSE";
-    resetGraffitiTapSwitchState();
-    setInputMode(InputMode::Mouse);
-  }
 }
 
 void sampleTouchState() {
@@ -1262,7 +1275,8 @@ void loop() {
     touchNeedsPolling = true;
   }
 
-  if (touchNeedsPolling && (now - g_lastTouchPollMs) >= kTouchPollMs) {
+  const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti) ? kGraffitiTouchPollMs : kTouchPollMs;
+  if (touchNeedsPolling && (now - g_lastTouchPollMs) >= touchPollMs) {
     g_lastTouchPollMs = now;
     if (g_inputMode == InputMode::Mouse) {
       sampleTouchState();
