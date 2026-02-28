@@ -830,93 +830,82 @@ bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t d
 
 void sampleGraffitiExitTapOnly() {
   const uint32_t now = millis();
+  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+
+  if (finger <= 0) {
+    if (!g_touchDown) {
+      g_touchActive = false;
+      return;
+    }
+
+    const uint32_t pressDuration = now - g_touchDownStartMs;
+    const int16_t deltaX = g_touchX - g_touchDownX;
+    const int16_t deltaY = g_touchY - g_touchDownY;
+    const int16_t absDx = abs(deltaX);
+    const int16_t absDy = abs(deltaY);
+    const bool tapLike = (pressDuration <= kTouchTapMaxDurationMs &&
+                          absDx <= kTouchTapMoveThresholdPx &&
+                          absDy <= kTouchTapMoveThresholdPx);
+
+    g_graffitiLastDeltaX = deltaX;
+    g_graffitiLastDeltaY = deltaY;
+    g_graffitiLastPressMs = static_cast<uint16_t>(std::min<uint32_t>(65535, pressDuration));
+    g_touchDown = false;
+    g_touchActive = false;
+    resetGraffitiStrokeState();
+
+    if (!tapLike) {
+      g_graffitiStatus = "EXIT TAP";
+      resetGraffitiTapSwitchState();
+      return;
+    }
+
+    if (g_graffitiTapArmed &&
+        (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
+      const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
+      const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
+      if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
+        g_graffitiStatus = "MODE->MOUSE";
+        resetGraffitiTapSwitchState();
+        setInputMode(InputMode::Mouse);
+        return;
+      }
+    }
+
+    g_graffitiTapArmed = true;
+    g_graffitiTapArmedMs = now;
+    g_graffitiTapAnchorX = g_touchDownX;
+    g_graffitiTapAnchorY = g_touchDownY;
+    g_graffitiStatus = "EXIT TAP1";
+    return;
+  }
+
   const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-
   if (x < 0 || y < 0) {
     g_graffitiReadFault = true;
-    if (g_touchDown && g_graffitiLastCoordMs != 0 &&
-        (now - g_graffitiLastCoordMs) > kGraffitiReleaseHoldMs) {
-      g_touchDown = false;
-      g_touchActive = false;
-      g_graffitiStatus = "EXIT TAP";
-      resetGraffitiTapSwitchState();
-      resetGraffitiStrokeState();
-    }
     return;
   }
 
   g_graffitiReadFault = false;
-  const bool coordTouch = (x != kCstIdleX) || (y != kCstIdleY);
-  if (coordTouch) {
-    g_touchActive = true;
-    g_touchX = x;
-    g_touchY = y;
-    g_lastTouchEventMs = now;
-    g_graffitiLastCoordMs = now;
-
-    if (!g_touchDown) {
-      g_touchDown = true;
-      g_touchDownStartMs = now;
-      g_touchDownX = x;
-      g_touchDownY = y;
-    }
-    if (!g_graffitiTapArmed) {
-      g_graffitiStatus = "EXIT TAP";
-    }
-    return;
-  }
+  g_touchActive = true;
+  g_touchX = x;
+  g_touchY = y;
+  g_lastTouchEventMs = now;
+  g_graffitiLastCoordMs = now;
 
   if (!g_touchDown) {
-    return;
+    g_touchDown = true;
+    g_touchDownStartMs = now;
+    g_touchDownX = x;
+    g_touchDownY = y;
   }
-
-  if (g_graffitiLastCoordMs != 0 &&
-      (now - g_graffitiLastCoordMs) <= kGraffitiReleaseHoldMs) {
-    return;
-  }
-
-  const uint32_t pressDuration = now - g_touchDownStartMs;
-  const int16_t deltaX = g_touchX - g_touchDownX;
-  const int16_t deltaY = g_touchY - g_touchDownY;
-  const int16_t absDx = abs(deltaX);
-  const int16_t absDy = abs(deltaY);
-  const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
-                        absDx <= kGraffitiTapMoveThresholdPx &&
-                        absDy <= kGraffitiTapMoveThresholdPx);
-  g_graffitiLastDeltaX = deltaX;
-  g_graffitiLastDeltaY = deltaY;
-  g_graffitiLastPressMs = static_cast<uint16_t>(std::min<uint32_t>(65535, pressDuration));
-
-  g_touchDown = false;
-  g_touchActive = false;
-  resetGraffitiStrokeState();
-
-  if (!tapLike) {
+  if (!g_graffitiTapArmed) {
     g_graffitiStatus = "EXIT TAP";
-    resetGraffitiTapSwitchState();
-    return;
   }
-
-  if (g_graffitiTapArmed &&
-      (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
-    const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
-    const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
-    if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
-      g_graffitiStatus = "MODE->MOUSE";
-      resetGraffitiTapSwitchState();
-      setInputMode(InputMode::Mouse);
-      return;
-    }
-  }
-
-  g_graffitiTapArmed = true;
-  g_graffitiTapArmedMs = now;
-  g_graffitiTapAnchorX = g_touchDownX;
-  g_graffitiTapAnchorY = g_touchDownY;
-  g_graffitiStatus = "EXIT TAP1";
 }
 
 void sampleGraffitiTouchState() {
@@ -1685,9 +1674,8 @@ void loop() {
   if (g_inputMode == InputMode::Mouse) {
     touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
   } else {
-    // In graffiti mode, only poll while an active stroke exists or on touch IRQ edge.
-    // This avoids continuous blind polling that can saturate I2C when CST sleeps.
-    touchNeedsPolling = touchEdge || g_touchDown;
+    // Keep release/tap detection reliable in both stroke and tap-only submodes.
+    touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
   }
 
   const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti) ? kGraffitiTouchPollMs : kTouchPollMs;
@@ -1720,7 +1708,7 @@ void loop() {
     if (g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
       resetGraffitiTapSwitchState();
       if (!g_touchDown) {
-        g_graffitiStatus = "READY";
+        g_graffitiStatus = g_graffitiTapOnlyActive ? "EXIT TAP" : "READY";
       }
     }
   }
