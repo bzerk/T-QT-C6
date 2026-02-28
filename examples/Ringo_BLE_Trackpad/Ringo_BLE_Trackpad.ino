@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <algorithm>
+#include <esp_system.h>
 #include <math.h>
 
 #include "Arduino_DriveBus_Library.h"
@@ -284,6 +285,45 @@ const char *modeName(InputMode mode) {
   return (mode == InputMode::Graffiti) ? "GRAFFITI" : "MOUSE";
 }
 
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:
+      return "UNKNOWN";
+    case ESP_RST_POWERON:
+      return "POWERON";
+    case ESP_RST_EXT:
+      return "EXT";
+    case ESP_RST_SW:
+      return "SW";
+    case ESP_RST_PANIC:
+      return "PANIC";
+    case ESP_RST_INT_WDT:
+      return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+      return "TASK_WDT";
+    case ESP_RST_WDT:
+      return "WDT";
+    case ESP_RST_DEEPSLEEP:
+      return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+      return "BROWNOUT";
+    case ESP_RST_SDIO:
+      return "SDIO";
+    case ESP_RST_USB:
+      return "USB";
+    case ESP_RST_JTAG:
+      return "JTAG";
+    case ESP_RST_EFUSE:
+      return "EFUSE";
+    case ESP_RST_PWR_GLITCH:
+      return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP:
+      return "CPU_LOCKUP";
+    default:
+      return "OTHER";
+  }
+}
+
 String textTail(const String &text, uint8_t maxLen) {
   if (text.length() <= maxLen) {
     return text;
@@ -442,7 +482,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] mode mouse|graffiti|mode?|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|ping|help");
 }
 
 void processSerialCommand(const char *line) {
@@ -457,16 +497,25 @@ void processSerialCommand(const char *line) {
     return;
   }
 
-  if (cmd == "mode graffiti") {
+  if (cmd == "g" || cmd == "graffiti" || cmd == "mode graffiti") {
     setInputMode(InputMode::Graffiti);
+    Serial.printf("[cmd] ok mode=%s\n", modeName(g_inputMode));
     return;
   }
-  if (cmd == "mode mouse") {
+  if (cmd == "m" || cmd == "mouse" || cmd == "mode mouse") {
     setInputMode(InputMode::Mouse);
+    Serial.printf("[cmd] ok mode=%s\n", modeName(g_inputMode));
     return;
   }
-  if (cmd == "mode?" || cmd == "mode") {
-    Serial.printf("[mode] %s\n", modeName(g_inputMode));
+  if (cmd == "mode?" || cmd == "mode" || cmd == "status") {
+    Serial.printf("[cmd] mode=%s touchDown=%u touchActive=%u n=%u l=%u invert=%u proj=%.2f\n",
+                  modeName(g_inputMode), g_touchDown ? 1U : 0U, g_touchActive ? 1U : 0U,
+                  g_graffitiStrokeCount, g_graffitiLastStrokePoints,
+                  isGraffitiUpsideDown() ? 1U : 0U, graffitiInvertProjection());
+    return;
+  }
+  if (cmd == "ping") {
+    Serial.println("[cmd] pong");
     return;
   }
   if (cmd == "help" || cmd == "?") {
@@ -486,7 +535,7 @@ void pollSerialCommands() {
     }
 
     const char c = static_cast<char>(in);
-    if (c == '\r' || c == '\n') {
+    if (c == '\r' || c == '\n' || c == ';') {
       if (g_serialCmdLen > 0) {
         g_serialCmdBuffer[g_serialCmdLen] = '\0';
         processSerialCommand(g_serialCmdBuffer);
@@ -1273,6 +1322,8 @@ void setup() {
 
   Serial.println();
   Serial.println("[boot] Ringo BLE trackpad starting");
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.printf("[boot] reset_reason=%s (%d)\n", resetReasonName(resetReason), static_cast<int>(resetReason));
   printCommandHelp();
 
   initBoardPowerAndDisplay();
