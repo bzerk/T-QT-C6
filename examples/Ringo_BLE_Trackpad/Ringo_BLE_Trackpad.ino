@@ -916,8 +916,13 @@ void initBoardPowerAndDisplay() {
     const bool watchdogDisabled = powerChip->IIC_Write_Device_State(
         Arduino_IIC_Power::Device::POWER_DEVICE_WATCHDOG_MODE,
         Arduino_IIC_Power::Device_State::POWER_DEVICE_OFF);
+    const String chargeState = powerChip->IIC_Read_Device_State(
+        Arduino_IIC_Power::Status_Information::POWER_CHARGING_STATUS);
+    const String inputState = powerChip->IIC_Read_Device_State(
+        Arduino_IIC_Power::Status_Information::POWER_INPUT_SOURCE_STATUS);
     Serial.printf("[power] charge=%s watchdog=%s\n", chargeEnabled ? "on" : "unchanged",
                   watchdogDisabled ? "off" : "unchanged");
+    Serial.printf("[power] pmic charge=%s input=%s\n", chargeState.c_str(), inputState.c_str());
   }
 
   pinMode(BREATHING_LIGHT, OUTPUT);
