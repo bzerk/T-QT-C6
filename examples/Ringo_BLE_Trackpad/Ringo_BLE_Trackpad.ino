@@ -24,9 +24,9 @@ constexpr uint32_t kImuPollMs = 8;
 constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
-constexpr uint16_t kGraffitiStrokeMinPoints = 6;
+constexpr uint16_t kGraffitiStrokeMinPoints = 4;
 constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
-constexpr int32_t kGraffitiMinPointDistanceSq = 9;
+constexpr int32_t kGraffitiMinPointDistanceSq = 4;
 constexpr uint32_t kGraffitiTapMaxDurationMs = 320;
 constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
 constexpr int16_t kModeExitTapSeparationPx = 42;
@@ -34,6 +34,8 @@ constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
 constexpr float kModeFlipSignThreshold = -0.30f;
 constexpr uint32_t kGraffitiIdleTouchPollMs = 40;
 constexpr uint8_t kGraffitiReleaseDebounceSamples = 2;
+constexpr int16_t kCstIdleX = 60;
+constexpr int16_t kCstIdleY = 150;
 constexpr bool kTouchGestureYInverted = true;
 constexpr uint8_t kSerialCmdMaxLen = 64;
 
@@ -121,6 +123,7 @@ bool g_swipeHandledThisTouch = false;
 GraffitiRecognizer g_graffitiRecognizer;
 GraffitiRecognizer::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
 uint16_t g_graffitiStrokeCount = 0;
+uint16_t g_graffitiLastStrokePoints = 0;
 uint32_t g_graffitiTouchStartMs = 0;
 String g_graffitiText = "";
 String g_graffitiStatus = "IDLE";
@@ -526,6 +529,7 @@ void graffitiAddPoint(int16_t x, int16_t y) {
 }
 
 void finalizeGraffitiStroke() {
+  g_graffitiLastStrokePoints = g_graffitiStrokeCount;
   if (g_graffitiStrokeCount < kGraffitiStrokeMinPoints) {
     g_graffitiStatus = "SHORT";
     g_graffitiLastMatch = "NONE";
@@ -569,7 +573,8 @@ void sampleGraffitiTouchState() {
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
   const bool coordValid = (x >= 0 && y >= 0);
-  const bool touchPresent = (finger > 0) || coordValid;
+  const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
+  const bool touchPresent = (finger > 0) || (coordValid && !coordIdle);
 
   if (!touchPresent) {
     if (g_touchDown) {
@@ -928,10 +933,11 @@ void renderStatus(bool force) {
     drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
     drawStatusLine(8, 114, "SwipeUp->Graffiti", YELLOW, force);
   } else {
-    snprintf(buf, sizeof(buf), "Gra:%s n%u I:%c %.2f", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
-             isModeFlipInverted() ? 'Y' : 'N', modeFlipProjection());
+    snprintf(buf, sizeof(buf), "Gra:%s n%u l%u", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
+             g_graffitiLastStrokePoints);
     drawStatusLine(6, 94, String(buf), WHITE, force);
-    snprintf(buf, sizeof(buf), "Match:%s %.2f", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+    snprintf(buf, sizeof(buf), "I:%c %.2f M:%s", isModeFlipInverted() ? 'Y' : 'N', modeFlipProjection(),
+             g_graffitiLastMatch.c_str());
     drawStatusLine(7, 104, String(buf), GREEN, force);
     drawStatusLine(8, 114, String("T:") + textTail(g_graffitiText, 7) + " U+2Tap->Mouse", YELLOW, force);
   }
