@@ -898,12 +898,26 @@ bool calibrateGyroBias() {
 }
 
 void initBoardPowerAndDisplay() {
+  Arduino_IIC *powerChip = nullptr;
   if (ETA4662->begin(kI2cBusHz)) {
     Serial.println("[power] ETA4662 init ok");
+    powerChip = ETA4662.get();
   } else if (SGM41562->begin(kI2cBusHz)) {
     Serial.println("[power] SGM41562 init ok");
+    powerChip = SGM41562.get();
   } else {
     Serial.println("[power] Power chip init failed");
+  }
+
+  if (powerChip != nullptr) {
+    const bool chargeEnabled = powerChip->IIC_Write_Device_State(
+        Arduino_IIC_Power::Device::POWER_DEVICE_CHARGING_MODE,
+        Arduino_IIC_Power::Device_State::POWER_DEVICE_ON);
+    const bool watchdogDisabled = powerChip->IIC_Write_Device_State(
+        Arduino_IIC_Power::Device::POWER_DEVICE_WATCHDOG_MODE,
+        Arduino_IIC_Power::Device_State::POWER_DEVICE_OFF);
+    Serial.printf("[power] charge=%s watchdog=%s\n", chargeEnabled ? "on" : "unchanged",
+                  watchdogDisabled ? "off" : "unchanged");
   }
 
   pinMode(BREATHING_LIGHT, OUTPUT);
