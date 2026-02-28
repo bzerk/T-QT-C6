@@ -26,6 +26,7 @@ constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kGraffitiTouchPollMs = 12;
 constexpr uint32_t kImuPollMs = 8;
+constexpr int32_t kI2cBusHz = 400000;
 constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
@@ -897,9 +898,9 @@ bool calibrateGyroBias() {
 }
 
 void initBoardPowerAndDisplay() {
-  if (ETA4662->begin()) {
+  if (ETA4662->begin(kI2cBusHz)) {
     Serial.println("[power] ETA4662 init ok");
-  } else if (SGM41562->begin()) {
+  } else if (SGM41562->begin(kI2cBusHz)) {
     Serial.println("[power] SGM41562 init ok");
   } else {
     Serial.println("[power] Power chip init failed");
@@ -927,7 +928,7 @@ void initBoardPowerAndDisplay() {
 
 void initTouch() {
   uint8_t attempt = 0;
-  while (!CST816T->begin()) {
+  while (!CST816T->begin(kI2cBusHz)) {
     attempt++;
     Serial.printf("[touch] init failed (%u), retrying...\n", attempt);
     delay(600);
@@ -950,7 +951,7 @@ void initImu() {
 #endif
 
   uint8_t attempt = 0;
-  while (!LSM6DSL->begin()) {
+  while (!LSM6DSL->begin(kI2cBusHz)) {
     attempt++;
     Serial.printf("[imu] init failed (%u), retrying...\n", attempt);
     delay(700);
