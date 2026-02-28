@@ -30,7 +30,8 @@ constexpr uint32_t kGraffitiTapMaxDurationMs = 320;
 constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
 constexpr int16_t kModeExitTapSeparationPx = 42;
 constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
-constexpr float kModeFlipSignThreshold = -0.06f;
+constexpr float kModeFlipSignThreshold = -0.30f;
+constexpr bool kTouchGestureYInverted = true;
 constexpr uint8_t kSerialCmdMaxLen = 64;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
@@ -272,6 +273,20 @@ String textTail(const String &text, uint8_t maxLen) {
     return text;
   }
   return text.substring(text.length() - maxLen);
+}
+
+String normalizeTouchGesture(const String &rawGesture) {
+  if (!kTouchGestureYInverted) {
+    return rawGesture;
+  }
+
+  if (rawGesture == "Swipe Up") {
+    return "Swipe Down";
+  }
+  if (rawGesture == "Swipe Down") {
+    return "Swipe Up";
+  }
+  return rawGesture;
 }
 
 void resetGraffitiStrokeState() {
@@ -915,15 +930,16 @@ void renderStatus(bool force) {
 }
 
 void handleGestureIfAny() {
-  String gesture = CST816T->IIC_Read_Device_State(
+  String rawGesture = CST816T->IIC_Read_Device_State(
       CST816T->Arduino_IIC_Touch::Status_Information::TOUCH_GESTURE_ID);
 
-  if (gesture == "NONE" || gesture.startsWith("->")) {
+  if (rawGesture == "NONE" || rawGesture.startsWith("->")) {
     return;
   }
 
+  String gesture = normalizeTouchGesture(rawGesture);
   g_lastGesture = gesture;
-  Serial.printf("[touch] gesture=%s\n", gesture.c_str());
+  Serial.printf("[touch] gesture raw=%s norm=%s\n", rawGesture.c_str(), gesture.c_str());
 
   if (gesture == "Swipe Up") {
     g_tapArmed = false;
