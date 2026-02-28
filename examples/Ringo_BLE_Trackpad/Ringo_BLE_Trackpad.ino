@@ -5,6 +5,7 @@
 #include "Arduino_DriveBus_Library.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
+#include "GraffitiRecognizer.h"
 
 #include <BLE2902.h>
 #include <BLEDevice.h>
@@ -21,6 +22,11 @@ constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kImuPollMs = 8;
 constexpr uint32_t kImuDebugIntervalMs = 500;
+constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
+constexpr uint16_t kGraffitiStrokeMinPoints = 6;
+constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
+constexpr int32_t kGraffitiMinPointDistanceSq = 9;
+constexpr uint8_t kSerialCmdMaxLen = 64;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
 constexpr float kGyroDeadzoneDps = 4.0f;
@@ -44,10 +50,16 @@ constexpr float kRollRateSuppressDps = 140.0f;
 constexpr int kYawSign = -1;
 constexpr int kPitchSign = 1;
 
+enum class InputMode : uint8_t {
+  Mouse,
+  Graffiti,
+};
+
 volatile bool g_touchInterrupt = false;
 bool g_bleConnected = false;
 bool g_touchActive = false;
 bool g_imuReady = false;
+InputMode g_inputMode = InputMode::Mouse;
 
 uint32_t g_lastTouchEventMs = 0;
 uint32_t g_lastTouchPollMs = 0;
@@ -97,6 +109,18 @@ uint32_t g_touchDownStartMs = 0;
 int16_t g_touchDownX = -1;
 int16_t g_touchDownY = -1;
 bool g_swipeHandledThisTouch = false;
+GraffitiRecognizer g_graffitiRecognizer;
+GraffitiRecognizer::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
+uint16_t g_graffitiStrokeCount = 0;
+uint32_t g_graffitiTouchStartMs = 0;
+String g_graffitiText = "";
+String g_graffitiStatus = "IDLE";
+String g_graffitiLastMatch = "NONE";
+float g_graffitiLastScore = 0.0f;
+char g_serialCmdBuffer[kSerialCmdMaxLen] = {0};
+uint8_t g_serialCmdLen = 0;
+
+void renderStatus(bool force = false);
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -227,6 +251,66 @@ void onTapReleased() {
   armTapWindow();
 }
 
+const char *modeName(InputMode mode) {
+  return (mode == InputMode::Graffiti) ? "GRAFFITI" : "MOUSE";
+}
+
+String textTail(const String &text, uint8_t maxLen) {
+  if (text.length() <= maxLen) {
+    return text;
+  }
+  return text.substring(text.length() - maxLen);
+}
+
+void resetGraffitiStrokeState() {
+  g_graffitiStrokeCount = 0;
+  g_graffitiTouchStartMs = 0;
+}
+
+void resetInputTransientState() {
+  g_touchDown = false;
+  g_touchLongActionFired = false;
+  g_swipeHandledThisTouch = false;
+  g_touchActive = false;
+  g_tapArmed = false;
+  g_lastGesture = "NONE";
+  g_clickMode = "FREE";
+
+  if (g_leftLockActive) {
+    setLeftLock(false);
+  }
+
+  g_airVelX = 0.0f;
+  g_airVelY = 0.0f;
+  g_airResidualX = 0.0f;
+  g_airResidualY = 0.0f;
+  g_lastDeltaX = 0;
+  g_lastDeltaY = 0;
+}
+
+void setInputMode(InputMode mode) {
+  if (g_inputMode == mode) {
+    return;
+  }
+
+  resetInputTransientState();
+  if (mode == InputMode::Graffiti) {
+    g_graffitiStatus = "READY";
+    g_graffitiLastMatch = "NONE";
+    g_graffitiLastScore = 0.0f;
+    resetGraffitiStrokeState();
+  } else {
+    g_graffitiStatus = "IDLE";
+    g_graffitiLastMatch = "NONE";
+    g_graffitiLastScore = 0.0f;
+    resetGraffitiStrokeState();
+  }
+
+  g_inputMode = mode;
+  Serial.printf("[mode] switched to %s\n", modeName(g_inputMode));
+  renderStatus(true);
+}
+
 void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color, bool force) {
   if (!force && g_prevStatusText[index] == text && g_prevStatusColor[index] == color) {
     return;
@@ -240,6 +324,189 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 
   g_prevStatusText[index] = text;
   g_prevStatusColor[index] = color;
+}
+
+void printCommandHelp() {
+  Serial.println("[cmd] mode mouse|graffiti|mode?|help");
+}
+
+void processSerialCommand(const char *line) {
+  if (line == nullptr) {
+    return;
+  }
+
+  String cmd(line);
+  cmd.trim();
+  cmd.toLowerCase();
+  if (cmd.isEmpty()) {
+    return;
+  }
+
+  if (cmd == "mode graffiti") {
+    setInputMode(InputMode::Graffiti);
+    return;
+  }
+  if (cmd == "mode mouse") {
+    setInputMode(InputMode::Mouse);
+    return;
+  }
+  if (cmd == "mode?" || cmd == "mode") {
+    Serial.printf("[mode] %s\n", modeName(g_inputMode));
+    return;
+  }
+  if (cmd == "help" || cmd == "?") {
+    printCommandHelp();
+    return;
+  }
+
+  Serial.printf("[cmd] unknown: %s\n", cmd.c_str());
+  printCommandHelp();
+}
+
+void pollSerialCommands() {
+  while (Serial.available() > 0) {
+    const int in = Serial.read();
+    if (in < 0) {
+      return;
+    }
+
+    const char c = static_cast<char>(in);
+    if (c == '\r' || c == '\n') {
+      if (g_serialCmdLen > 0) {
+        g_serialCmdBuffer[g_serialCmdLen] = '\0';
+        processSerialCommand(g_serialCmdBuffer);
+        g_serialCmdLen = 0;
+      }
+      continue;
+    }
+
+    if (g_serialCmdLen < (kSerialCmdMaxLen - 1)) {
+      g_serialCmdBuffer[g_serialCmdLen++] = c;
+    } else {
+      g_serialCmdLen = 0;
+      Serial.println("[cmd] command too long");
+    }
+  }
+}
+
+String graffitiSymbolLabel(char symbol) {
+  if (symbol == ' ') {
+    return "SPACE";
+  }
+  if (symbol == '\b') {
+    return "BKSP";
+  }
+  char buf[2] = {symbol, '\0'};
+  return String(buf);
+}
+
+void applyGraffitiSymbol(char symbol) {
+  if (symbol == '\b') {
+    if (!g_graffitiText.isEmpty()) {
+      g_graffitiText.remove(g_graffitiText.length() - 1);
+    }
+    return;
+  }
+
+  g_graffitiText += symbol;
+  if (g_graffitiText.length() > 96) {
+    g_graffitiText = g_graffitiText.substring(g_graffitiText.length() - 96);
+  }
+}
+
+void graffitiAddPoint(int16_t x, int16_t y) {
+  if (g_graffitiStrokeCount > 0) {
+    const float dx = static_cast<float>(x) - g_graffitiStroke[g_graffitiStrokeCount - 1].x;
+    const float dy = static_cast<float>(y) - g_graffitiStroke[g_graffitiStrokeCount - 1].y;
+    const float distanceSq = (dx * dx) + (dy * dy);
+    if (distanceSq < static_cast<float>(kGraffitiMinPointDistanceSq)) {
+      return;
+    }
+  }
+
+  if (g_graffitiStrokeCount >= kGraffitiStrokeMaxPoints) {
+    return;
+  }
+
+  g_graffitiStroke[g_graffitiStrokeCount].x = static_cast<float>(x);
+  g_graffitiStroke[g_graffitiStrokeCount].y = static_cast<float>(y);
+  g_graffitiStrokeCount++;
+}
+
+void finalizeGraffitiStroke() {
+  if (g_graffitiStrokeCount < kGraffitiStrokeMinPoints) {
+    g_graffitiStatus = "SHORT";
+    g_graffitiLastMatch = "NONE";
+    g_graffitiLastScore = 0.0f;
+    resetGraffitiStrokeState();
+    return;
+  }
+
+  GraffitiRecognizer::Result result;
+  if (!g_graffitiRecognizer.recognize(g_graffitiStroke, g_graffitiStrokeCount, result)) {
+    g_graffitiStatus = "ERROR";
+    g_graffitiLastMatch = "NONE";
+    g_graffitiLastScore = 0.0f;
+    resetGraffitiStrokeState();
+    return;
+  }
+
+  g_graffitiLastScore = result.score;
+  g_graffitiLastMatch = String(result.name) + ":" + graffitiSymbolLabel(result.symbol);
+  if (result.score >= GraffitiRecognizer::kAcceptScore) {
+    g_graffitiStatus = "ACCEPT";
+    applyGraffitiSymbol(result.symbol);
+    Serial.printf("[graffiti] ACCEPT %s score=%.2f\n", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+  } else {
+    g_graffitiStatus = "REJECT";
+    Serial.printf("[graffiti] REJECT %s score=%.2f\n", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+  }
+
+  resetGraffitiStrokeState();
+}
+
+void sampleGraffitiTouchState() {
+  const uint32_t now = millis();
+  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+
+  if (finger <= 0) {
+    if (g_touchDown) {
+      g_touchDown = false;
+      g_touchActive = false;
+      finalizeGraffitiStroke();
+    }
+    return;
+  }
+
+  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+
+  if (x < 0 || y < 0) {
+    return;
+  }
+
+  g_touchActive = true;
+  g_touchX = x;
+  g_touchY = y;
+  g_lastTouchEventMs = now;
+
+  if (!g_touchDown) {
+    g_touchDown = true;
+    g_graffitiStatus = "DRAW";
+    g_graffitiTouchStartMs = now;
+    resetGraffitiStrokeState();
+  }
+
+  graffitiAddPoint(x, y);
+  if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
+    g_touchDown = false;
+    g_touchActive = false;
+    g_graffitiStatus = "TIMEOUT";
+    finalizeGraffitiStroke();
+  }
 }
 
 bool normalize3(float &x, float &y, float &z) {
@@ -486,7 +753,7 @@ void initBleMouse() {
   Serial.println("[ble] HID mouse started, advertising as 'Ringo'");
 }
 
-void renderStatus(bool force = false) {
+void renderStatus(bool force) {
   const uint32_t now = millis();
   if (!force && (now - g_lastDisplayRefreshMs) < kDisplayRefreshMs) {
     return;
@@ -504,7 +771,7 @@ void renderStatus(bool force = false) {
 
   char buf[48];
   drawStatusLine(0, 10, String(kDeviceName), CYAN, force);
-  drawStatusLine(1, 24, String("BLE: ") + (g_bleConnected ? "CONNECTED" : "ADVERTISING"), WHITE, force);
+  drawStatusLine(1, 24, String("Mode: ") + modeName(g_inputMode), WHITE, force);
   snprintf(buf, sizeof(buf), "Roll:%5.1f D:%1.2f", g_rollRateDps, g_rollDamp);
   drawStatusLine(2, 38, String(buf), WHITE, force);
 
@@ -517,9 +784,16 @@ void renderStatus(bool force = false) {
   snprintf(buf, sizeof(buf), "Move:%4d,%4d", g_lastDeltaX, g_lastDeltaY);
   drawStatusLine(5, 80, String(buf), WHITE, force);
 
-  drawStatusLine(6, 94, String("G:") + g_lastGesture, WHITE, force);
-  drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
-  drawStatusLine(8, 114, "cu.usbmodem1101", YELLOW, force);
+  if (g_inputMode == InputMode::Mouse) {
+    drawStatusLine(6, 94, String("G:") + g_lastGesture, WHITE, force);
+    drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
+    drawStatusLine(8, 114, "cmd: mode graffiti", YELLOW, force);
+  } else {
+    drawStatusLine(6, 94, String("Graff:") + g_graffitiStatus, WHITE, force);
+    snprintf(buf, sizeof(buf), "Match:%s %.2f", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+    drawStatusLine(7, 104, String(buf), GREEN, force);
+    drawStatusLine(8, 114, String("Text:") + textTail(g_graffitiText, 13), YELLOW, force);
+  }
 }
 
 void handleGestureIfAny() {
@@ -760,6 +1034,7 @@ void setup() {
 
   Serial.println();
   Serial.println("[boot] Ringo BLE trackpad starting");
+  printCommandHelp();
 
   initBoardPowerAndDisplay();
   initTouch();
@@ -772,34 +1047,43 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
   bool touchEdge = false;
+  pollSerialCommands();
 
   if (g_touchInterrupt) {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
     touchEdge = true;
-    handleGestureIfAny();
+    if (g_inputMode == InputMode::Mouse) {
+      handleGestureIfAny();
+    }
   }
 
   const bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
   if (touchNeedsPolling && (now - g_lastTouchPollMs) >= kTouchPollMs) {
     g_lastTouchPollMs = now;
-    sampleTouchState();
+    if (g_inputMode == InputMode::Mouse) {
+      sampleTouchState();
+    } else {
+      sampleGraffitiTouchState();
+    }
   }
 
   if (g_touchActive && (now - g_lastTouchEventMs) > kTouchReleaseTimeoutMs) {
     g_touchActive = false;
   }
 
-  if (g_tapArmed && static_cast<int32_t>(g_tapArmDeadlineMs - now) < 0) {
-    g_tapArmed = false;
-    if (!g_leftLockActive) {
-      g_clickMode = "FREE";
+  if (g_inputMode == InputMode::Mouse) {
+    if (g_tapArmed && static_cast<int32_t>(g_tapArmDeadlineMs - now) < 0) {
+      g_tapArmed = false;
+      if (!g_leftLockActive) {
+        g_clickMode = "FREE";
+      }
     }
-  }
 
-  if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
-    g_lastImuPollMs = now;
-    updateAirMouse();
+    if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
+      g_lastImuPollMs = now;
+      updateAirMouse();
+    }
   }
 
   renderStatus();
