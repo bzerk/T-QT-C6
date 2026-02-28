@@ -20,6 +20,7 @@
 namespace {
 constexpr char kDeviceName[] = "Ringo";
 constexpr uint8_t kMouseReportId = 0x01;
+constexpr uint8_t kKeyboardReportId = 0x02;
 
 constexpr uint32_t kDisplayRefreshMs = 140;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
@@ -49,6 +50,7 @@ constexpr int16_t kCstIdleX = 60;
 constexpr int16_t kCstIdleY = 150;
 constexpr bool kTouchGestureYInverted = true;
 constexpr uint8_t kSerialCmdMaxLen = 64;
+constexpr uint32_t kSerialBootWaitMs = 250;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
 constexpr float kGyroDeadzoneDps = 4.0f;
@@ -161,6 +163,8 @@ void renderStatus(bool force = false);
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
+BLECharacteristic *g_inputKeyboard = nullptr;
+BLECharacteristic *g_outputKeyboard = nullptr;
 BLEAdvertising *g_advertising = nullptr;
 
 Arduino_DataBus *bus = new Arduino_HWSPI(
@@ -237,6 +241,65 @@ void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel = 0) {
 
   g_inputMouse->setValue(report, sizeof(report));
   g_inputMouse->notify();
+}
+
+void sendKeyboardReport(uint8_t modifier, uint8_t keyUsage) {
+  if (!g_bleConnected || g_inputKeyboard == nullptr) {
+    return;
+  }
+
+  uint8_t report[8] = {0};
+  report[0] = modifier;
+  report[2] = keyUsage;
+
+  g_inputKeyboard->setValue(report, sizeof(report));
+  g_inputKeyboard->notify();
+}
+
+void tapKeyboardUsage(uint8_t modifier, uint8_t keyUsage) {
+  sendKeyboardReport(modifier, keyUsage);
+  delay(8);
+  sendKeyboardReport(0, 0);
+}
+
+bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
+  modifier = 0;
+  usage = 0;
+
+  if (symbol >= 'a' && symbol <= 'z') {
+    usage = static_cast<uint8_t>(0x04 + (symbol - 'a'));
+    return true;
+  }
+  if (symbol >= 'A' && symbol <= 'Z') {
+    usage = static_cast<uint8_t>(0x04 + (symbol - 'A'));
+    modifier = 0x02;  // Left Shift.
+    return true;
+  }
+
+  switch (symbol) {
+    case ' ':
+      usage = 0x2C;
+      return true;
+    case '\b':
+      usage = 0x2A;
+      return true;
+    case '\n':
+    case '\r':
+      usage = 0x28;
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool sendKeyboardSymbol(char symbol) {
+  uint8_t modifier = 0;
+  uint8_t usage = 0;
+  if (!mapSymbolToKeyboardUsage(symbol, modifier, usage)) {
+    return false;
+  }
+  tapKeyboardUsage(modifier, usage);
+  return true;
 }
 
 void setButtonMask(uint8_t mask) {
@@ -579,18 +642,19 @@ String graffitiSymbolLabel(char symbol) {
   return String(buf);
 }
 
-void applyGraffitiSymbol(char symbol) {
+bool applyGraffitiSymbol(char symbol) {
   if (symbol == '\b') {
     if (!g_graffitiText.isEmpty()) {
       g_graffitiText.remove(g_graffitiText.length() - 1);
     }
-    return;
+    return sendKeyboardSymbol(symbol);
   }
 
   g_graffitiText += symbol;
   if (g_graffitiText.length() > 96) {
     g_graffitiText = g_graffitiText.substring(g_graffitiText.length() - 96);
   }
+  return sendKeyboardSymbol(symbol);
 }
 
 void graffitiAddPoint(int16_t x, int16_t y) {
@@ -637,8 +701,9 @@ void finalizeGraffitiStroke() {
   g_graffitiLastMatch = String(result.name) + ":" + graffitiSymbolLabel(result.symbol);
   if (result.score >= GraffitiRecognizer::kAcceptScore) {
     g_graffitiStatus = "ACCEPT";
-    applyGraffitiSymbol(result.symbol);
-    Serial.printf("[graffiti] ACCEPT %s score=%.2f\n", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+    const bool keySent = applyGraffitiSymbol(result.symbol);
+    Serial.printf("[graffiti] ACCEPT %s score=%.2f kbd=%s\n", g_graffitiLastMatch.c_str(),
+                  g_graffitiLastScore, keySent ? "ok" : "skip");
   } else {
     g_graffitiStatus = "REJECT";
     Serial.printf("[graffiti] REJECT %s score=%.2f\n", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
@@ -1002,6 +1067,40 @@ void initImu() {
 void initBleMouse() {
   static uint8_t reportMap[] = {
       0x05, 0x01,        // Usage Page (Generic Desktop)
+      0x09, 0x06,        // Usage (Keyboard)
+      0xA1, 0x01,        // Collection (Application)
+      0x85, kKeyboardReportId,
+      0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+      0x19, 0xE0,        //   Usage Minimum (Keyboard Left Control)
+      0x29, 0xE7,        //   Usage Maximum (Keyboard Right GUI)
+      0x15, 0x00,        //   Logical Minimum (0)
+      0x25, 0x01,        //   Logical Maximum (1)
+      0x75, 0x01,        //   Report Size (1)
+      0x95, 0x08,        //   Report Count (8)
+      0x81, 0x02,        //   Input (Data,Var,Abs)
+      0x95, 0x01,        //   Report Count (1)
+      0x75, 0x08,        //   Report Size (8)
+      0x81, 0x01,        //   Input (Const,Array,Abs)
+      0x95, 0x05,        //   Report Count (5)
+      0x75, 0x01,        //   Report Size (1)
+      0x05, 0x08,        //   Usage Page (LEDs)
+      0x19, 0x01,        //   Usage Minimum (Num Lock)
+      0x29, 0x05,        //   Usage Maximum (Kana)
+      0x91, 0x02,        //   Output (Data,Var,Abs)
+      0x95, 0x01,        //   Report Count (1)
+      0x75, 0x03,        //   Report Size (3)
+      0x91, 0x01,        //   Output (Const,Array,Abs)
+      0x95, 0x06,        //   Report Count (6)
+      0x75, 0x08,        //   Report Size (8)
+      0x15, 0x00,        //   Logical Minimum (0)
+      0x25, 0x65,        //   Logical Maximum (101)
+      0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+      0x19, 0x00,        //   Usage Minimum (Reserved)
+      0x29, 0x65,        //   Usage Maximum (Keyboard Application)
+      0x81, 0x00,        //   Input (Data,Array,Abs)
+      0xC0,              // End Collection
+
+      0x05, 0x01,        // Usage Page (Generic Desktop)
       0x09, 0x02,        // Usage (Mouse)
       0xA1, 0x01,        // Collection (Application)
       0x85, kMouseReportId,
@@ -1037,6 +1136,8 @@ void initBleMouse() {
 
   g_hid = new BLEHIDDevice(server);
   g_inputMouse = g_hid->inputReport(kMouseReportId);
+  g_inputKeyboard = g_hid->inputReport(kKeyboardReportId);
+  g_outputKeyboard = g_hid->outputReport(kKeyboardReportId);
 
   g_hid->manufacturer()->setValue("LILYGO");
   g_hid->pnp(0x02, 0x05AC, 0x820A, 0x0210);
@@ -1053,11 +1154,11 @@ void initBleMouse() {
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_NO_MITM);
 
   g_advertising = server->getAdvertising();
-  g_advertising->setAppearance(HID_MOUSE);
+  g_advertising->setAppearance(GENERIC_HID);
   g_advertising->addServiceUUID(g_hid->hidService()->getUUID());
   g_advertising->start();
 
-  Serial.println("[ble] HID mouse started, advertising as 'Ringo'");
+  Serial.println("[ble] HID mouse+keyboard started, advertising as 'Ringo'");
 }
 
 void renderStatus(bool force) {
@@ -1367,7 +1468,7 @@ void updateAirMouse() {
 void setup() {
   Serial.begin(115200);
   const uint32_t serialWaitStart = millis();
-  while (!Serial && (millis() - serialWaitStart) < 1500) {
+  while (!Serial && (millis() - serialWaitStart) < kSerialBootWaitMs) {
     delay(10);
   }
 
