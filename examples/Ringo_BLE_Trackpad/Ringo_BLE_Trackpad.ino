@@ -26,6 +26,10 @@ constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
 constexpr uint16_t kGraffitiStrokeMinPoints = 6;
 constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
 constexpr int32_t kGraffitiMinPointDistanceSq = 9;
+constexpr uint32_t kGraffitiTapMaxDurationMs = 220;
+constexpr int16_t kGraffitiTapMoveThresholdPx = 14;
+constexpr uint32_t kModeExitDoubleTapWindowMs = 420;
+constexpr float kModeFlipSignThreshold = -0.35f;
 constexpr uint8_t kSerialCmdMaxLen = 64;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
@@ -119,6 +123,11 @@ String g_graffitiLastMatch = "NONE";
 float g_graffitiLastScore = 0.0f;
 char g_serialCmdBuffer[kSerialCmdMaxLen] = {0};
 uint8_t g_serialCmdLen = 0;
+uint32_t g_graffitiTapArmedMs = 0;
+bool g_graffitiTapArmed = false;
+bool g_modeFlipRefReady = false;
+uint8_t g_modeFlipRefAxis = 2;
+float g_modeFlipRefSign = 1.0f;
 
 void renderStatus(bool force = false);
 
@@ -267,6 +276,53 @@ void resetGraffitiStrokeState() {
   g_graffitiTouchStartMs = 0;
 }
 
+void resetGraffitiTapSwitchState() {
+  g_graffitiTapArmed = false;
+  g_graffitiTapArmedMs = 0;
+}
+
+float gravityAxisValue(uint8_t axis) {
+  if (axis == 0) {
+    return g_gravityX;
+  }
+  if (axis == 1) {
+    return g_gravityY;
+  }
+  return g_gravityZ;
+}
+
+void maybeCaptureModeFlipReference() {
+  if (g_modeFlipRefReady) {
+    return;
+  }
+
+  const float ax = fabsf(g_gravityX);
+  const float ay = fabsf(g_gravityY);
+  const float az = fabsf(g_gravityZ);
+
+  if (ax > ay && ax > az) {
+    g_modeFlipRefAxis = 0;
+  } else if (ay > az) {
+    g_modeFlipRefAxis = 1;
+  } else {
+    g_modeFlipRefAxis = 2;
+  }
+
+  const float v = gravityAxisValue(g_modeFlipRefAxis);
+  g_modeFlipRefSign = (v >= 0.0f) ? 1.0f : -1.0f;
+  g_modeFlipRefReady = true;
+  Serial.printf("[mode] flip-ref axis=%u sign=%.0f\n", g_modeFlipRefAxis, g_modeFlipRefSign);
+}
+
+bool isModeFlipInverted() {
+  if (!g_modeFlipRefReady) {
+    return false;
+  }
+
+  const float projection = gravityAxisValue(g_modeFlipRefAxis) * g_modeFlipRefSign;
+  return projection <= kModeFlipSignThreshold;
+}
+
 void resetInputTransientState() {
   g_touchDown = false;
   g_touchLongActionFired = false;
@@ -286,6 +342,8 @@ void resetInputTransientState() {
   g_airResidualY = 0.0f;
   g_lastDeltaX = 0;
   g_lastDeltaY = 0;
+  resetGraffitiTapSwitchState();
+  resetGraffitiStrokeState();
 }
 
 void setInputMode(InputMode mode) {
@@ -299,11 +357,13 @@ void setInputMode(InputMode mode) {
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
     resetGraffitiStrokeState();
+    resetGraffitiTapSwitchState();
   } else {
     g_graffitiStatus = "IDLE";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
     resetGraffitiStrokeState();
+    resetGraffitiTapSwitchState();
   }
 
   g_inputMode = mode;
@@ -472,9 +532,37 @@ void sampleGraffitiTouchState() {
 
   if (finger <= 0) {
     if (g_touchDown) {
+      const uint32_t pressDuration = now - g_touchDownStartMs;
+      const int16_t absDx = abs(g_touchX - g_touchDownX);
+      const int16_t absDy = abs(g_touchY - g_touchDownY);
+      const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
+                            absDx <= kGraffitiTapMoveThresholdPx &&
+                            absDy <= kGraffitiTapMoveThresholdPx);
+      bool handled = false;
+
+      if (tapLike && isModeFlipInverted()) {
+        if (g_graffitiTapArmed &&
+            (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
+          g_graffitiStatus = "MODE->MOUSE";
+          resetGraffitiTapSwitchState();
+          g_touchDown = false;
+          g_touchActive = false;
+          setInputMode(InputMode::Mouse);
+          return;
+        }
+
+        g_graffitiTapArmed = true;
+        g_graffitiTapArmedMs = now;
+        g_graffitiStatus = "EXIT TAP1";
+        resetGraffitiStrokeState();
+        handled = true;
+      }
+
       g_touchDown = false;
       g_touchActive = false;
-      finalizeGraffitiStroke();
+      if (!handled) {
+        finalizeGraffitiStroke();
+      }
     }
     return;
   }
@@ -497,6 +585,9 @@ void sampleGraffitiTouchState() {
     g_touchDown = true;
     g_graffitiStatus = "DRAW";
     g_graffitiTouchStartMs = now;
+    g_touchDownStartMs = now;
+    g_touchDownX = x;
+    g_touchDownY = y;
     resetGraffitiStrokeState();
   }
 
@@ -787,12 +878,13 @@ void renderStatus(bool force) {
   if (g_inputMode == InputMode::Mouse) {
     drawStatusLine(6, 94, String("G:") + g_lastGesture, WHITE, force);
     drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
-    drawStatusLine(8, 114, "cmd: mode graffiti", YELLOW, force);
+    drawStatusLine(8, 114, "SwipeUp->Graffiti", YELLOW, force);
   } else {
-    drawStatusLine(6, 94, String("Graff:") + g_graffitiStatus, WHITE, force);
+    drawStatusLine(6, 94, String("Graff:") + g_graffitiStatus + (isModeFlipInverted() ? " INV:Y" : " INV:N"),
+                   WHITE, force);
     snprintf(buf, sizeof(buf), "Match:%s %.2f", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
     drawStatusLine(7, 104, String(buf), GREEN, force);
-    drawStatusLine(8, 114, String("Text:") + textTail(g_graffitiText, 13), YELLOW, force);
+    drawStatusLine(8, 114, String("T:") + textTail(g_graffitiText, 7) + " U+2Tap->Mouse", YELLOW, force);
   }
 }
 
@@ -810,7 +902,8 @@ void handleGestureIfAny() {
   if (gesture == "Swipe Up") {
     g_tapArmed = false;
     g_swipeHandledThisTouch = true;
-    sendMouseReport(g_buttonMask, 0, 0, 1);
+    g_lastGesture = "Mode->Graffiti";
+    setInputMode(InputMode::Graffiti);
   } else if (gesture == "Swipe Down") {
     g_tapArmed = false;
     g_swipeHandledThisTouch = true;
@@ -916,6 +1009,24 @@ void sampleTouchState() {
   }
 }
 
+void updateImuOrientationOnly() {
+  ImuSample sample;
+  if (!readImuSample(sample)) {
+    return;
+  }
+
+  float ax = sample.ax_mg;
+  float ay = sample.ay_mg;
+  float az = sample.az_mg;
+  if (normalize3(ax, ay, az)) {
+    g_gravityX = ((1.0f - kGravityLpfAlpha) * g_gravityX) + (kGravityLpfAlpha * ax);
+    g_gravityY = ((1.0f - kGravityLpfAlpha) * g_gravityY) + (kGravityLpfAlpha * ay);
+    g_gravityZ = ((1.0f - kGravityLpfAlpha) * g_gravityZ) + (kGravityLpfAlpha * az);
+    normalize3(g_gravityX, g_gravityY, g_gravityZ);
+    maybeCaptureModeFlipReference();
+  }
+}
+
 void updateAirMouse() {
   ImuSample sample;
   if (!readImuSample(sample)) {
@@ -937,6 +1048,7 @@ void updateAirMouse() {
     g_gravityY = ((1.0f - kGravityLpfAlpha) * g_gravityY) + (kGravityLpfAlpha * ay);
     g_gravityZ = ((1.0f - kGravityLpfAlpha) * g_gravityZ) + (kGravityLpfAlpha * az);
     normalize3(g_gravityX, g_gravityY, g_gravityZ);
+    maybeCaptureModeFlipReference();
   }
 
   constexpr float kForwardX = 0.0f;
@@ -1083,6 +1195,18 @@ void loop() {
     if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
       g_lastImuPollMs = now;
       updateAirMouse();
+    }
+  } else {
+    if (g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
+      resetGraffitiTapSwitchState();
+      if (!g_touchDown) {
+        g_graffitiStatus = "READY";
+      }
+    }
+
+    if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
+      g_lastImuPollMs = now;
+      updateImuOrientationOnly();
     }
   }
 
