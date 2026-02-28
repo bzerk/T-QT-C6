@@ -51,6 +51,9 @@ constexpr int16_t kCstIdleY = 150;
 constexpr bool kTouchGestureYInverted = true;
 constexpr uint8_t kSerialCmdMaxLen = 64;
 constexpr uint32_t kSerialBootWaitMs = 250;
+constexpr uint8_t kSetupShiftConnectAttempts = 4;
+constexpr uint32_t kSetupShiftInitialDelayMs = 450;
+constexpr uint32_t kSetupShiftRetryMs = 320;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
 constexpr float kGyroDeadzoneDps = 4.0f;
@@ -158,6 +161,9 @@ bool g_graffitiReadFault = false;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
+bool g_setupShiftPending = false;
+uint8_t g_setupShiftAttemptsRemaining = 0;
+uint32_t g_setupShiftNextMs = 0;
 
 void renderStatus(bool force = false);
 
@@ -206,6 +212,10 @@ class ServerCallbacks final : public BLEServerCallbacks {
     (void)server;
     g_bleConnected = true;
     Serial.println("[ble] Connected");
+    g_setupShiftPending = true;
+    g_setupShiftAttemptsRemaining = kSetupShiftConnectAttempts;
+    g_setupShiftNextMs = millis() + kSetupShiftInitialDelayMs;
+    Serial.println("[ble] setup shift queued");
   }
 
   void onDisconnect(BLEServer *server) override {
@@ -215,6 +225,8 @@ class ServerCallbacks final : public BLEServerCallbacks {
     g_leftLockActive = false;
     g_clickMode = "FREE";
     g_tapArmed = false;
+    g_setupShiftPending = false;
+    g_setupShiftAttemptsRemaining = 0;
     Serial.println("[ble] Disconnected, advertising");
     if (g_advertising != nullptr) {
       delay(20);
@@ -300,6 +312,41 @@ bool sendKeyboardSymbol(char symbol) {
   }
   tapKeyboardUsage(modifier, usage);
   return true;
+}
+
+void queueSetupShift(uint8_t attempts, uint32_t delayMs) {
+  if (attempts == 0) {
+    g_setupShiftPending = false;
+    g_setupShiftAttemptsRemaining = 0;
+    return;
+  }
+  g_setupShiftPending = true;
+  g_setupShiftAttemptsRemaining = attempts;
+  g_setupShiftNextMs = millis() + delayMs;
+}
+
+void serviceSetupShift() {
+  if (!g_setupShiftPending || !g_bleConnected) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_setupShiftNextMs) < 0) {
+    return;
+  }
+
+  // Modifier-only report: left shift pressed and released.
+  tapKeyboardUsage(0x02, 0x00);
+
+  if (g_setupShiftAttemptsRemaining > 0) {
+    --g_setupShiftAttemptsRemaining;
+  }
+
+  if (g_setupShiftAttemptsRemaining == 0) {
+    g_setupShiftPending = false;
+    Serial.println("[kbd] setup shift done");
+  } else {
+    g_setupShiftNextMs = now + kSetupShiftRetryMs;
+  }
 }
 
 void setButtonMask(uint8_t mask) {
@@ -553,7 +600,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -589,6 +636,15 @@ void processSerialCommand(const char *line) {
                   modeName(g_inputMode), g_touchDown ? 1U : 0U, g_touchActive ? 1U : 0U,
                   g_graffitiStrokeCount, g_graffitiLastStrokePoints,
                   isGraffitiUpsideDown() ? 1U : 0U, graffitiInvertProjection());
+    return;
+  }
+  if (cmd == "shift") {
+    if (!g_bleConnected) {
+      setCommandAck("shift no-link");
+    } else {
+      queueSetupShift(1, 20);
+      setCommandAck("shift queued");
+    }
     return;
   }
   if (cmd == "ping") {
@@ -1507,6 +1563,7 @@ void loop() {
   const uint32_t now = millis();
   bool touchEdge = false;
   pollSerialCommands();
+  serviceSetupShift();
 
   if (g_touchInterrupt) {
     g_touchInterrupt = false;
