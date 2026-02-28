@@ -21,6 +21,7 @@ constexpr uint32_t kDisplayRefreshMs = 140;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kImuPollMs = 8;
+constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
 constexpr uint16_t kGraffitiStrokeMinPoints = 6;
@@ -948,15 +949,46 @@ void handleGestureIfAny() {
   g_lastGesture = gesture;
   Serial.printf("[touch] gesture raw=%s norm=%s\n", rawGesture.c_str(), gesture.c_str());
 
-  if (gesture == "Swipe Up") {
-    g_tapArmed = false;
-    g_swipeHandledThisTouch = true;
-    g_lastGesture = "Mode->Graffiti";
-    setInputMode(InputMode::Graffiti);
-  } else if (gesture == "Swipe Down") {
-    g_tapArmed = false;
-    g_swipeHandledThisTouch = true;
-    sendMouseReport(g_buttonMask, 0, 0, -1);
+  if (g_inputMode == InputMode::Mouse) {
+    if (gesture == "Swipe Up") {
+      g_tapArmed = false;
+      g_swipeHandledThisTouch = true;
+      g_lastGesture = "Mode->Graffiti";
+      setInputMode(InputMode::Graffiti);
+    } else if (gesture == "Swipe Down") {
+      g_tapArmed = false;
+      g_swipeHandledThisTouch = true;
+      sendMouseReport(g_buttonMask, 0, 0, -1);
+    }
+    return;
+  }
+
+  if (gesture == "Single Click" || gesture == "Double Click") {
+    if (!isModeFlipInverted()) {
+      resetGraffitiTapSwitchState();
+      return;
+    }
+
+    const uint32_t now = millis();
+    if (g_graffitiTapArmed &&
+        (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
+      g_graffitiStatus = "MODE->MOUSE";
+      resetGraffitiTapSwitchState();
+      setInputMode(InputMode::Mouse);
+      return;
+    }
+
+    g_graffitiTapArmed = true;
+    g_graffitiTapArmedMs = now;
+    g_graffitiStatus = "EXIT TAP1";
+    return;
+  }
+
+  // Recovery path so mode switching never gets stuck.
+  if (gesture == "Swipe Down") {
+    g_graffitiStatus = "MODE->MOUSE";
+    resetGraffitiTapSwitchState();
+    setInputMode(InputMode::Mouse);
   }
 }
 
@@ -1214,9 +1246,7 @@ void loop() {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
     touchEdge = true;
-    if (g_inputMode == InputMode::Mouse) {
-      handleGestureIfAny();
-    }
+    handleGestureIfAny();
   }
 
   bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
@@ -1259,7 +1289,9 @@ void loop() {
       }
     }
 
-    if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
+    if (!g_touchDown &&
+        g_imuReady &&
+        (now - g_lastImuPollMs) >= kGraffitiImuPollMs) {
       g_lastImuPollMs = now;
       updateImuOrientationOnly();
     }
