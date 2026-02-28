@@ -610,13 +610,13 @@ void sampleGraffitiTouchState() {
     g_graffitiNoFingerSamples = 0;
 
     if (!g_touchDown) {
+      resetGraffitiStrokeState();
       g_touchDown = true;
       g_graffitiStatus = "DRAW";
       g_graffitiTouchStartMs = now;
       g_touchDownStartMs = now;
       g_touchDownX = x;
       g_touchDownY = y;
-      resetGraffitiStrokeState();
       g_graffitiLastCoordMs = now;
     }
 
