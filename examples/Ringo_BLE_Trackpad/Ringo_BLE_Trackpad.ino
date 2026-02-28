@@ -166,6 +166,7 @@ uint8_t g_setupShiftAttemptsRemaining = 0;
 uint32_t g_setupShiftNextMs = 0;
 
 void renderStatus(bool force = false);
+void updateImuOrientationOnly();
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -809,7 +810,7 @@ void sampleGraffitiTouchState() {
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
   const bool coordTouch = coordValid && !coordIdle;
   const bool touchPresentRaw = coordTouch;
-  const bool invertedNow = isGraffitiUpsideDown();
+  bool invertedNow = isGraffitiUpsideDown();
 
   if (coordTouch) {
     g_touchActive = true;
@@ -866,6 +867,12 @@ void sampleGraffitiTouchState() {
   if (g_graffitiLastCoordMs != 0 &&
       (now - g_graffitiLastCoordMs) <= kGraffitiReleaseHoldMs) {
     return;
+  }
+
+  // Refresh orientation right at release so exit-tap gating does not use stale gravity.
+  if (g_imuReady) {
+    updateImuOrientationOnly();
+    invertedNow = isGraffitiUpsideDown();
   }
 
   const uint32_t pressDuration = now - g_touchDownStartMs;
