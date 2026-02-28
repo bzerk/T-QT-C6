@@ -32,8 +32,9 @@ constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
 constexpr uint16_t kGraffitiStrokeMinPoints = 4;
 constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
 constexpr int32_t kGraffitiMinPointDistanceSq = 1;
-constexpr uint32_t kGraffitiTapMaxDurationMs = 320;
-constexpr int16_t kGraffitiTapMoveThresholdPx = 24;
+constexpr uint32_t kGraffitiTapMaxDurationMs = 520;
+constexpr int16_t kGraffitiTapMoveThresholdPx = 42;
+constexpr uint16_t kGraffitiTapMaxStrokePoints = 6;
 constexpr int16_t kModeExitTapSeparationPx = 42;
 constexpr uint32_t kModeExitDoubleTapWindowMs = 800;
 constexpr uint8_t kGraffitiInvertAxis = 1;  // Device Y axis
@@ -738,9 +739,12 @@ void sampleGraffitiTouchState() {
   const int16_t deltaY = g_touchY - g_touchDownY;
   const int16_t absDx = abs(deltaX);
   const int16_t absDy = abs(deltaY);
-  const bool tapLike = (pressDuration <= kGraffitiTapMaxDurationMs &&
-                        absDx <= kGraffitiTapMoveThresholdPx &&
-                        absDy <= kGraffitiTapMoveThresholdPx);
+  const bool tapLikeByMotion = (pressDuration <= kGraffitiTapMaxDurationMs &&
+                                absDx <= kGraffitiTapMoveThresholdPx &&
+                                absDy <= kGraffitiTapMoveThresholdPx);
+  const bool tapLikeByStrokeSize = (pressDuration <= (kGraffitiTapMaxDurationMs + 180) &&
+                                    g_graffitiStrokeCount <= kGraffitiTapMaxStrokePoints);
+  const bool tapLike = tapLikeByMotion || tapLikeByStrokeSize;
   const bool inverted = isGraffitiUpsideDown();
   g_graffitiLastDeltaX = deltaX;
   g_graffitiLastDeltaY = deltaY;
@@ -780,6 +784,9 @@ void sampleGraffitiTouchState() {
 
   if (tapLike && !inverted) {
     resetGraffitiTapSwitchState();
+    g_graffitiStatus = "TAP";
+    resetGraffitiStrokeState();
+    return;
   }
 
   if (g_graffitiStrokeCount > 0) {
