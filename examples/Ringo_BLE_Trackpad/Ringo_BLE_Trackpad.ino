@@ -24,7 +24,7 @@ constexpr uint8_t kMouseReportId = 0x01;
 constexpr uint32_t kDisplayRefreshMs = 140;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
-constexpr uint32_t kGraffitiTouchPollMs = 8;
+constexpr uint32_t kGraffitiTouchPollMs = 12;
 constexpr uint32_t kImuPollMs = 8;
 constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
@@ -150,6 +150,7 @@ uint32_t g_graffitiLastCoordMs = 0;
 int16_t g_graffitiLastDeltaX = 0;
 int16_t g_graffitiLastDeltaY = 0;
 uint16_t g_graffitiLastPressMs = 0;
+bool g_graffitiReadFault = false;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -356,6 +357,7 @@ void resetGraffitiStrokeState() {
   g_graffitiLastDeltaX = 0;
   g_graffitiLastDeltaY = 0;
   g_graffitiLastPressMs = 0;
+  g_graffitiReadFault = false;
 }
 
 void resetGraffitiTapSwitchState() {
@@ -662,17 +664,28 @@ bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t d
 
 void sampleGraffitiTouchState() {
   const uint32_t now = millis();
-  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
   const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-  const bool hasFinger = (finger > 0);
+  if (x < 0 || y < 0) {
+    g_graffitiReadFault = true;
+    if (g_touchDown &&
+        g_graffitiLastCoordMs != 0 &&
+        (now - g_graffitiLastCoordMs) > kGraffitiReleaseHoldMs) {
+      g_touchDown = false;
+      g_touchActive = false;
+      g_graffitiStatus = "T-ERR";
+      resetGraffitiTapSwitchState();
+      resetGraffitiStrokeState();
+    }
+    return;
+  }
+  g_graffitiReadFault = false;
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
   const bool coordTouch = coordValid && !coordIdle;
-  const bool touchPresentRaw = hasFinger || coordTouch;
+  const bool touchPresentRaw = coordTouch;
 
   if (coordTouch) {
     g_touchActive = true;
@@ -1061,8 +1074,8 @@ void renderStatus(bool force) {
     snprintf(buf, sizeof(buf), "Gra:%s n%u l%u", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
              g_graffitiLastStrokePoints);
     drawStatusLine(6, 94, String(buf), WHITE, force);
-    snprintf(buf, sizeof(buf), "I:%c %.2f M:%s", isGraffitiUpsideDown() ? 'Y' : 'N', graffitiInvertProjection(),
-             g_graffitiLastMatch.c_str());
+    snprintf(buf, sizeof(buf), "I:%c %.2f %s", isGraffitiUpsideDown() ? 'Y' : 'N',
+             graffitiInvertProjection(), g_graffitiReadFault ? "T-ERR" : "T-OK");
     drawStatusLine(7, 104, String(buf), GREEN, force);
     drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
   }
@@ -1359,11 +1372,13 @@ void loop() {
     }
   }
 
-  bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
-  if (!touchNeedsPolling &&
-      g_inputMode == InputMode::Graffiti &&
-      (now - g_lastTouchPollMs) >= kGraffitiIdleTouchPollMs) {
-    touchNeedsPolling = true;
+  bool touchNeedsPolling = false;
+  if (g_inputMode == InputMode::Mouse) {
+    touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
+  } else {
+    // In graffiti mode, only poll while an active stroke exists or on touch IRQ edge.
+    // This avoids continuous blind polling that can saturate I2C when CST sleeps.
+    touchNeedsPolling = touchEdge || g_touchDown;
   }
 
   const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti) ? kGraffitiTouchPollMs : kTouchPollMs;
