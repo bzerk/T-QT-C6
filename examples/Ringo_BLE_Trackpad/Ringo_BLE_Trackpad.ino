@@ -1,3 +1,6 @@
+#ifndef ARDUINO_USB_CDC_ON_BOOT
+#define ARDUINO_USB_CDC_ON_BOOT 1
+#endif
 #include <Arduino.h>
 #include <algorithm>
 #include <esp_system.h>
@@ -91,6 +94,7 @@ int8_t g_lastDeltaX = 0;
 int8_t g_lastDeltaY = 0;
 String g_lastGesture = "NONE";
 String g_clickMode = "FREE";
+String g_lastCmdAck = "BOOT";
 
 float g_gyroBiasX = 0.0f;  // mdps
 float g_gyroBiasY = 0.0f;  // mdps
@@ -485,6 +489,11 @@ void printCommandHelp() {
   Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|ping|help");
 }
 
+void setCommandAck(const String &ack) {
+  g_lastCmdAck = ack;
+  Serial.printf("[cmd] %s\n", g_lastCmdAck.c_str());
+}
+
 void processSerialCommand(const char *line) {
   if (line == nullptr) {
     return;
@@ -499,15 +508,16 @@ void processSerialCommand(const char *line) {
 
   if (cmd == "g" || cmd == "graffiti" || cmd == "mode graffiti") {
     setInputMode(InputMode::Graffiti);
-    Serial.printf("[cmd] ok mode=%s\n", modeName(g_inputMode));
+    setCommandAck(String("ok mode=") + modeName(g_inputMode));
     return;
   }
   if (cmd == "m" || cmd == "mouse" || cmd == "mode mouse") {
     setInputMode(InputMode::Mouse);
-    Serial.printf("[cmd] ok mode=%s\n", modeName(g_inputMode));
+    setCommandAck(String("ok mode=") + modeName(g_inputMode));
     return;
   }
   if (cmd == "mode?" || cmd == "mode" || cmd == "status") {
+    setCommandAck(String("mode=") + modeName(g_inputMode));
     Serial.printf("[cmd] mode=%s touchDown=%u touchActive=%u n=%u l=%u invert=%u proj=%.2f\n",
                   modeName(g_inputMode), g_touchDown ? 1U : 0U, g_touchActive ? 1U : 0U,
                   g_graffitiStrokeCount, g_graffitiLastStrokePoints,
@@ -515,15 +525,16 @@ void processSerialCommand(const char *line) {
     return;
   }
   if (cmd == "ping") {
-    Serial.println("[cmd] pong");
+    setCommandAck("pong");
     return;
   }
   if (cmd == "help" || cmd == "?") {
+    setCommandAck("help");
     printCommandHelp();
     return;
   }
 
-  Serial.printf("[cmd] unknown: %s\n", cmd.c_str());
+  setCommandAck(String("unknown: ") + cmd);
   printCommandHelp();
 }
 
@@ -1042,7 +1053,7 @@ void renderStatus(bool force) {
     drawStatusLine(5, 80, String(buf), WHITE, force);
     drawStatusLine(6, 94, String("G:") + g_lastGesture, WHITE, force);
     drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
-    drawStatusLine(8, 114, "SwipeUp->Graffiti", YELLOW, force);
+    drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
   } else {
     snprintf(buf, sizeof(buf), "dX:%4d dY:%4d t:%3u", g_graffitiLastDeltaX, g_graffitiLastDeltaY,
              g_graffitiLastPressMs);
@@ -1053,7 +1064,7 @@ void renderStatus(bool force) {
     snprintf(buf, sizeof(buf), "I:%c %.2f M:%s", isGraffitiUpsideDown() ? 'Y' : 'N', graffitiInvertProjection(),
              g_graffitiLastMatch.c_str());
     drawStatusLine(7, 104, String(buf), GREEN, force);
-    drawStatusLine(8, 114, String("T:") + textTail(g_graffitiText, 7) + " U+2Tap->Mouse", YELLOW, force);
+    drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
   }
 }
 
