@@ -563,8 +563,14 @@ void sampleGraffitiTouchState() {
   const uint32_t now = millis();
   const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+  const bool coordValid = (x >= 0 && y >= 0);
+  const bool touchPresent = (finger > 0) || coordValid;
 
-  if (finger <= 0) {
+  if (!touchPresent) {
     if (g_touchDown) {
       g_graffitiNoFingerSamples++;
       if (g_graffitiNoFingerSamples < kGraffitiReleaseDebounceSamples) {
@@ -616,15 +622,6 @@ void sampleGraffitiTouchState() {
     return;
   }
   g_graffitiNoFingerSamples = 0;
-
-  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-
-  if (x < 0 || y < 0) {
-    return;
-  }
 
   g_touchActive = true;
   g_touchX = x;
