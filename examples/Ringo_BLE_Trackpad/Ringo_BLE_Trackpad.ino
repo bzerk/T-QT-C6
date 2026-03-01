@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <esp_system.h>
 #include <math.h>
+#include <Preferences.h>
 
 #include "Arduino_DriveBus_Library.h"
 #include "Arduino_GFX_Library.h"
@@ -77,6 +78,19 @@ constexpr float kRollRateDampStartDps = 45.0f;
 constexpr float kRollRateSuppressDps = 140.0f;
 constexpr int kYawSign = -1;
 constexpr int kPitchSign = 1;
+
+constexpr char kGyroBiasNvsNamespace[] = "ringo_imu";
+constexpr char kGyroBiasNvsKey[] = "gyro_bias";
+constexpr uint32_t kGyroBiasRecordMagic = 0x52424759;  // "RGBY"
+constexpr uint16_t kGyroBiasRecordVersion = 1;
+constexpr uint32_t kAutoBiasMinStillMs = 3500;
+constexpr uint16_t kAutoBiasMinSamples = 100;
+constexpr float kAutoBiasStillRateDps = 1.1f;
+constexpr float kAutoBiasStillAccelTolG = 0.10f;
+constexpr float kAutoBiasApplyDeltaMdps = 80.0f;
+constexpr float kAutoBiasBlendAlpha = 0.25f;
+constexpr float kAutoBiasSaveDeltaMdps = 180.0f;
+constexpr uint32_t kAutoBiasSaveIntervalMs = 180000;
 
 enum class InputMode : uint8_t {
   Mouse,
@@ -166,9 +180,21 @@ float g_modeFlipRefSign = 1.0f;
 bool g_setupShiftPending = false;
 uint8_t g_setupShiftAttemptsRemaining = 0;
 uint32_t g_setupShiftNextMs = 0;
+uint32_t g_stationarySinceMs = 0;
+uint16_t g_stationarySamples = 0;
+float g_stationaryGyroSumX = 0.0f;
+float g_stationaryGyroSumY = 0.0f;
+float g_stationaryGyroSumZ = 0.0f;
+uint32_t g_lastBiasSaveMs = 0;
 
 void renderStatus(bool force = false);
 void updateImuOrientationOnly();
+struct ImuSample;
+bool loadGyroBiasFromNvs();
+bool saveGyroBiasToNvs();
+void resetStationaryBiasEstimator();
+void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps);
+bool recalibrateGyroBias(bool persistBias);
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -208,6 +234,15 @@ struct ImuSample {
   float gx_mdps;
   float gy_mdps;
   float gz_mdps;
+};
+
+struct GyroBiasRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  float biasX_mdps;
+  float biasY_mdps;
+  float biasZ_mdps;
 };
 
 class ServerCallbacks final : public BLEServerCallbacks {
@@ -399,6 +434,140 @@ void onTapReleased() {
   g_clickMode = "L-CLICK";
   sendLeftClick();
   armTapWindow();
+}
+
+bool saveGyroBiasToNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kGyroBiasNvsNamespace, false)) {
+    Serial.println("[imu] NVS open failed (write)");
+    return false;
+  }
+
+  GyroBiasRecord record = {
+      kGyroBiasRecordMagic,
+      kGyroBiasRecordVersion,
+      0,
+      g_gyroBiasX,
+      g_gyroBiasY,
+      g_gyroBiasZ,
+  };
+  const size_t written = prefs.putBytes(kGyroBiasNvsKey, &record, sizeof(record));
+  prefs.end();
+  if (written != sizeof(record)) {
+    Serial.println("[imu] NVS save failed");
+    return false;
+  }
+
+  g_lastBiasSaveMs = millis();
+  Serial.printf("[imu] Bias saved to NVS: x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+  return true;
+}
+
+bool loadGyroBiasFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kGyroBiasNvsNamespace, true)) {
+    Serial.println("[imu] NVS open failed (read)");
+    return false;
+  }
+
+  const size_t storedLen = prefs.getBytesLength(kGyroBiasNvsKey);
+  if (storedLen != sizeof(GyroBiasRecord)) {
+    prefs.end();
+    return false;
+  }
+
+  GyroBiasRecord record;
+  const size_t readLen = prefs.getBytes(kGyroBiasNvsKey, &record, sizeof(record));
+  prefs.end();
+  if (readLen != sizeof(record)) {
+    return false;
+  }
+
+  if (record.magic != kGyroBiasRecordMagic || record.version != kGyroBiasRecordVersion) {
+    return false;
+  }
+  if (!isfinite(record.biasX_mdps) || !isfinite(record.biasY_mdps) || !isfinite(record.biasZ_mdps)) {
+    return false;
+  }
+  if (fabsf(record.biasX_mdps) > 20000.0f || fabsf(record.biasY_mdps) > 20000.0f ||
+      fabsf(record.biasZ_mdps) > 20000.0f) {
+    return false;
+  }
+
+  g_gyroBiasX = record.biasX_mdps;
+  g_gyroBiasY = record.biasY_mdps;
+  g_gyroBiasZ = record.biasZ_mdps;
+  g_lastBiasSaveMs = millis();
+  Serial.printf("[imu] Bias loaded from NVS: x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+  return true;
+}
+
+void resetStationaryBiasEstimator() {
+  g_stationarySinceMs = 0;
+  g_stationarySamples = 0;
+  g_stationaryGyroSumX = 0.0f;
+  g_stationaryGyroSumY = 0.0f;
+  g_stationaryGyroSumZ = 0.0f;
+}
+
+void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps) {
+  const float accelMagG = sqrtf((sample.ax_mg * sample.ax_mg) +
+                                (sample.ay_mg * sample.ay_mg) +
+                                (sample.az_mg * sample.az_mg)) /
+                          1000.0f;
+  const bool still = fabsf(gx_dps) <= kAutoBiasStillRateDps &&
+                     fabsf(gy_dps) <= kAutoBiasStillRateDps &&
+                     fabsf(gz_dps) <= kAutoBiasStillRateDps &&
+                     fabsf(accelMagG - 1.0f) <= kAutoBiasStillAccelTolG &&
+                     !g_touchDown && !g_touchActive;
+  if (!still) {
+    resetStationaryBiasEstimator();
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (g_stationarySinceMs == 0) {
+    g_stationarySinceMs = now;
+    g_stationarySamples = 0;
+    g_stationaryGyroSumX = 0.0f;
+    g_stationaryGyroSumY = 0.0f;
+    g_stationaryGyroSumZ = 0.0f;
+  }
+
+  g_stationaryGyroSumX += sample.gx_mdps;
+  g_stationaryGyroSumY += sample.gy_mdps;
+  g_stationaryGyroSumZ += sample.gz_mdps;
+  if (g_stationarySamples < 65535) {
+    g_stationarySamples++;
+  }
+
+  if ((now - g_stationarySinceMs) < kAutoBiasMinStillMs || g_stationarySamples < kAutoBiasMinSamples) {
+    return;
+  }
+
+  const float candidateX = g_stationaryGyroSumX / g_stationarySamples;
+  const float candidateY = g_stationaryGyroSumY / g_stationarySamples;
+  const float candidateZ = g_stationaryGyroSumZ / g_stationarySamples;
+  const float dx = candidateX - g_gyroBiasX;
+  const float dy = candidateY - g_gyroBiasY;
+  const float dz = candidateZ - g_gyroBiasZ;
+  const float deltaMag = sqrtf((dx * dx) + (dy * dy) + (dz * dz));
+  if (deltaMag < kAutoBiasApplyDeltaMdps) {
+    resetStationaryBiasEstimator();
+    return;
+  }
+
+  g_gyroBiasX += dx * kAutoBiasBlendAlpha;
+  g_gyroBiasY += dy * kAutoBiasBlendAlpha;
+  g_gyroBiasZ += dz * kAutoBiasBlendAlpha;
+  Serial.printf("[imu] Auto-bias trim %.1f mdps -> x=%.2f y=%.2f z=%.2f\n", deltaMag,
+                g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+
+  if (deltaMag >= kAutoBiasSaveDeltaMdps &&
+      (now - g_lastBiasSaveMs) >= kAutoBiasSaveIntervalMs) {
+    saveGyroBiasToNvs();
+  }
+  resetStationaryBiasEstimator();
 }
 
 const char *modeName(InputMode mode) {
@@ -637,7 +806,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -673,6 +842,12 @@ void processSerialCommand(const char *line) {
                   modeName(g_inputMode), g_touchDown ? 1U : 0U, g_touchActive ? 1U : 0U,
                   g_graffitiStrokeCount, g_graffitiLastStrokePoints,
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
+    Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+    return;
+  }
+  if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
+    const bool ok = recalibrateGyroBias(true);
+    setCommandAck(ok ? "ok cal" : "err cal");
     return;
   }
   if (cmd == "shift") {
@@ -1123,6 +1298,26 @@ bool calibrateGyroBias() {
   return true;
 }
 
+bool recalibrateGyroBias(bool persistBias) {
+  const bool calibrated = calibrateGyroBias();
+  if (!calibrated) {
+    return false;
+  }
+
+  resetStationaryBiasEstimator();
+  g_airVelX = 0.0f;
+  g_airVelY = 0.0f;
+  g_airResidualX = 0.0f;
+  g_airResidualY = 0.0f;
+  g_lastDeltaX = 0;
+  g_lastDeltaY = 0;
+
+  if (persistBias) {
+    saveGyroBiasToNvs();
+  }
+  return true;
+}
+
 void initBoardPowerAndDisplay() {
   Arduino_IIC *powerChip = nullptr;
   if (ETA4662->begin(kI2cBusHz)) {
@@ -1212,14 +1407,19 @@ void initImu() {
   LSM6DSL->IIC_Write_Device_Value(LSM6DSL->Arduino_IIC_IMU::Device_Value::IMU_GYROSCOPE_SENSITIVITY,
                                   2000);
 
-  const bool calibrated = calibrateGyroBias();
-  if (!calibrated) {
-    g_gyroBiasX = 0.0f;
-    g_gyroBiasY = 0.0f;
-    g_gyroBiasZ = 0.0f;
-    Serial.println("[imu] Using zero bias fallback");
+  const bool loaded = loadGyroBiasFromNvs();
+  if (!loaded) {
+    Serial.println("[imu] No stored bias, calibrating...");
+    const bool calibrated = recalibrateGyroBias(true);
+    if (!calibrated) {
+      g_gyroBiasX = 0.0f;
+      g_gyroBiasY = 0.0f;
+      g_gyroBiasZ = 0.0f;
+      Serial.println("[imu] Using zero bias fallback");
+    }
   }
 
+  resetStationaryBiasEstimator();
   g_imuReady = true;
   g_lastImuSampleUs = micros();
   Serial.printf("[imu] ready, id=0x%X\n", (uint8_t)LSM6DSL->IIC_Device_ID());
@@ -1574,6 +1774,7 @@ void updateAirMouse() {
   g_yawRateDps = yawRate;
   g_pitchRateDps = pitchRate;
   g_rollRateDps = rollRate;
+  serviceAutoGyroBiasCorrection(sample, gx, gy, gz);
 
   const float rateMag = sqrtf((yawRate * yawRate) + (pitchRate * pitchRate));
   const float accelNorm = std::min(1.0f, rateMag / kRateAccelRefDps);
