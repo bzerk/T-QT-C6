@@ -11,25 +11,68 @@ This file is the stroke-source reference for the firmware recognizer.
 - Stroke is represented as directional segments in normalized screen coordinates (`+X` right, `+Y` down).
 - Segment tokens: `U`, `D`, `L`, `R`, `UL`, `UR`, `DL`, `DR`.
 
-## Phase 1: Active symbols in firmware
+## Phase 2: Trie Token Set (current firmware)
 
-These are the symbols currently implemented in `GraffitiRecognizer.cpp`.
+These token sequences back the trie+beam decoder in `GraffitiRecognizer.cpp`.
+They are intentionally simple, hand-tunable direction signatures from the
+Graffiti chart and are expected to be iteratively tuned with device testing.
 
-| Symbol | Graffiti intent | Segment sequence |
-| --- | --- | --- |
-| `a` | caret-like A (`^`) | `UR, DR` |
-| `i` | vertical stroke | `D` |
-| `l` | down then right | `D, R` |
-| `n` | N unistroke | `U, DR, U` |
-| `o` | closed loop O | `R, D, L, U` (continuous curve) |
-| `u` | U shape | `D, DR, UR, U` |
-| `v` | V shape | `DR, UR` |
-| `z` | Z zig-zag | `R, DL, R` |
-| `\b` | Backspace gesture | `L` |
-| `SPACE` | Space gesture | `R` |
+### Letters
 
-## Next expansion
+| Symbol | Segment sequence |
+| --- | --- |
+| `a` | `UR, DR` |
+| `b` | `D, UR, DR, DL` |
+| `c` | `UR, UL, DL, DR` |
+| `d` | `D, UR, DR, DL, U` |
+| `e` | `R, DL, R` |
+| `f` | `R, D` |
+| `g` | `UR, UL, DL, DR, R` |
+| `h` | `D, U, D` |
+| `i` | `D` |
+| `j` | `D, DL` |
+| `k` | `D, UR, DL, UR` |
+| `l` | `D, R` |
+| `m` | `D, U, D, U, D` |
+| `n` | `U, DR, U` |
+| `o` | `DR, DL, UL, UR` |
+| `p` | `D, UR, DR, D` |
+| `q` | `DR, DL, UL, UR, D` |
+| `r` | `D, UR, DR` |
+| `s` | `R, DL, L, DR, R` |
+| `t` | `D, R` |
+| `u` | `D, DR, UR, U` |
+| `v` | `DR, UR` |
+| `w` | `DR, UR, DR, UR` |
+| `x` | `DR, UL, DR` |
+| `y` | `D, DR, UR, D` |
+| `z` | `R, DL, R` |
 
-- Add full Graffiti-1 letter/digit/punctuation set to this table first.
-- Keep this file as the canonical shape spec.
-- Keep template anchors in code aligned to this file (not vice versa).
+### Digits
+
+| Symbol | Segment sequence |
+| --- | --- |
+| `0` | `DR, DL, UL, UR` |
+| `1` | `D` |
+| `2` | `R, DL, R` |
+| `3` | `R, DL, R, DL, R` |
+| `4` | `D, R, U` |
+| `5` | `R, D, L, R` |
+| `6` | `DL, D, R, U, L` |
+| `7` | `R, DL` |
+| `8` | `DR, UR, DL, UR, DR` |
+| `9` | `DR, DL, UL, UR, D` |
+
+### Controls
+
+| Symbol | Segment sequence |
+| --- | --- |
+| `SPACE` | `R` |
+| `RET` | `DL` |
+| `BKSP` | `L` |
+
+## Notes
+
+- Some symbols are intentionally near each other in token space (e.g. `z` and
+  `2`), and are disambiguated by trie edit cost + fallback point matcher.
+- Keep this file as the source of truth for token edits.

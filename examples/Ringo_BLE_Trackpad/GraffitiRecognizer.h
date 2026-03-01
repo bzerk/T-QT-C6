@@ -25,11 +25,15 @@ class GraffitiRecognizer {
  private:
   static constexpr uint8_t kMaxDirectionTokens = 24;
   static constexpr float kVectorAcceptScore = 0.62f;
+  static constexpr uint16_t kMaxDirectionTrieNodes = 512;
 
-  static bool recognizeByDirectionSequence(const Point *rawPoints, uint16_t rawCount, Result &out);
+  static bool recognizeByDirectionTrie(const Point *rawPoints, uint16_t rawCount, Result &out);
+  static void buildDirectionTrie();
+  static void searchDirectionTrieNode(uint16_t nodeIndex, const uint8_t *inputTokens, uint8_t inputCount,
+                                      const float *prevRow, float &bestCost, float &secondCost, int &bestEntry);
+  static float directionSubstitutionCost(uint8_t inputToken, uint8_t templateToken);
   static uint8_t quantizeDirection(float dx, float dy);
   static uint8_t extractDirectionTokens(const Point *input, uint16_t count, uint8_t *tokens, uint8_t maxTokens);
-  static float directionSequenceDistance(const uint8_t *a, uint8_t aCount, const uint8_t *b, uint8_t bCount);
 
   static bool prepareStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount);
   static bool resample(const Point *input, uint16_t inCount, Point *out, uint16_t outCount);

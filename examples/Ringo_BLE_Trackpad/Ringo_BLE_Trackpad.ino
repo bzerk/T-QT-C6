@@ -325,6 +325,14 @@ bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
     modifier = 0x02;  // Left Shift.
     return true;
   }
+  if (symbol >= '1' && symbol <= '9') {
+    usage = static_cast<uint8_t>(0x1E + (symbol - '1'));
+    return true;
+  }
+  if (symbol == '0') {
+    usage = 0x27;
+    return true;
+  }
 
   switch (symbol) {
     case ' ':
@@ -917,6 +925,9 @@ String graffitiSymbolLabel(char symbol) {
   }
   if (symbol == '\b') {
     return "BKSP";
+  }
+  if (symbol == '\n' || symbol == '\r') {
+    return "RET";
   }
   char buf[2] = {symbol, '\0'};
   return String(buf);
