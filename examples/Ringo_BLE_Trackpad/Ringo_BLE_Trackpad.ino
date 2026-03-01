@@ -709,11 +709,6 @@ float graffitiInvertProjection() {
 }
 
 void updateGraffitiTapOnlyMode() {
-  if (g_inputMode != InputMode::Graffiti) {
-    g_graffitiTapOnlyActive = false;
-    return;
-  }
-
   const float projection = graffitiInvertProjection();
   const bool nextTapOnly =
       g_graffitiTapOnlyActive ? (projection <= kGraffitiInvertExitThreshold)
@@ -725,18 +720,27 @@ void updateGraffitiTapOnlyMode() {
 
   g_graffitiTapOnlyActive = nextTapOnly;
   resetGraffitiStrokeState();
+  resetGraffitiTapSwitchState();
   g_touchDown = false;
   g_touchActive = false;
+  g_touchLongActionFired = false;
+  g_swipeHandledThisTouch = false;
+  g_tapArmed = false;
+
+  if (g_leftLockActive) {
+    setLeftLock(false);
+  }
 
   if (g_graffitiTapOnlyActive) {
-    g_graffitiStatus = "EXIT TAP";
-    Serial.printf("[graffiti] tap-only ON (proj=%.2f)\n", projection);
+    g_graffitiStatus = "CMD TAP";
+    Serial.printf("[mode] command pose ON (proj=%.2f)\n", projection);
   } else {
-    resetGraffitiTapSwitchState();
     if (g_inputMode == InputMode::Graffiti) {
       g_graffitiStatus = "READY";
+    } else {
+      g_graffitiStatus = "IDLE";
     }
-    Serial.printf("[graffiti] tap-only OFF (proj=%.2f)\n", projection);
+    Serial.printf("[mode] command pose OFF (proj=%.2f)\n", projection);
   }
 }
 
@@ -788,6 +792,14 @@ void setInputMode(InputMode mode) {
   g_inputMode = mode;
   Serial.printf("[mode] switched to %s\n", modeName(g_inputMode));
   renderStatus(true);
+}
+
+void toggleInputMode() {
+  if (g_inputMode == InputMode::Mouse) {
+    setInputMode(InputMode::Graffiti);
+  } else {
+    setInputMode(InputMode::Mouse);
+  }
 }
 
 void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color, bool force) {
@@ -1031,7 +1043,7 @@ void sampleGraffitiExitTapOnly() {
     resetGraffitiStrokeState();
 
     if (!tapLike) {
-      g_graffitiStatus = "EXIT TAP";
+      g_graffitiStatus = "CMD TAP";
       resetGraffitiTapSwitchState();
       return;
     }
@@ -1041,9 +1053,10 @@ void sampleGraffitiExitTapOnly() {
       const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
       const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
       if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
-        g_graffitiStatus = "MODE->MOUSE";
+        const bool toGraffiti = (g_inputMode == InputMode::Mouse);
+        g_graffitiStatus = toGraffiti ? "MODE->GRAF" : "MODE->MOUSE";
         resetGraffitiTapSwitchState();
-        setInputMode(InputMode::Mouse);
+        toggleInputMode();
         return;
       }
     }
@@ -1052,7 +1065,7 @@ void sampleGraffitiExitTapOnly() {
     g_graffitiTapArmedMs = now;
     g_graffitiTapAnchorX = g_touchDownX;
     g_graffitiTapAnchorY = g_touchDownY;
-    g_graffitiStatus = "EXIT TAP1";
+    g_graffitiStatus = "CMD TAP1";
     return;
   }
 
@@ -1079,7 +1092,7 @@ void sampleGraffitiExitTapOnly() {
     g_touchDownY = y;
   }
   if (!g_graffitiTapArmed) {
-    g_graffitiStatus = "EXIT TAP";
+    g_graffitiStatus = "CMD TAP";
   }
 }
 
@@ -1176,13 +1189,6 @@ void sampleGraffitiTouchState() {
 
   g_touchDown = false;
   g_touchActive = false;
-
-  if (isGraffitiSwipeDownExit(pressDuration, deltaX, deltaY, g_graffitiStrokeCount)) {
-    g_graffitiStatus = "MODE->MOUSE";
-    resetGraffitiTapSwitchState();
-    setInputMode(InputMode::Mouse);
-    return;
-  }
 
   if (tapLike) {
     resetGraffitiTapSwitchState();
@@ -1553,7 +1559,9 @@ void renderStatus(bool force) {
   if (g_inputMode == InputMode::Mouse) {
     snprintf(buf, sizeof(buf), "Move:%4d,%4d", g_lastDeltaX, g_lastDeltaY);
     drawStatusLine(5, 80, String(buf), WHITE, force);
-    drawStatusLine(6, 94, String("G:") + g_lastGesture, WHITE, force);
+    snprintf(buf, sizeof(buf), "G:%s I:%c", textTail(g_lastGesture, 10).c_str(),
+             g_graffitiTapOnlyActive ? 'Y' : 'N');
+    drawStatusLine(6, 94, String(buf), WHITE, force);
     drawStatusLine(7, 104, String("Click:") + g_clickMode, GREEN, force);
     drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
   } else {
@@ -1582,16 +1590,12 @@ void handleGestureIfAny() {
   g_lastGesture = gesture;
   Serial.printf("[touch] gesture raw=%s norm=%s\n", rawGesture.c_str(), gesture.c_str());
 
-  if (g_inputMode == InputMode::Mouse) {
-    if (gesture == "Swipe Up") {
+  if (g_inputMode == InputMode::Mouse && !g_graffitiTapOnlyActive) {
+    if (gesture == "Swipe Up" || gesture == "Swipe Down") {
       g_tapArmed = false;
       g_swipeHandledThisTouch = true;
-      g_lastGesture = "Mode->Graffiti";
-      setInputMode(InputMode::Graffiti);
-    } else if (gesture == "Swipe Down") {
-      g_tapArmed = false;
-      g_swipeHandledThisTouch = true;
-      sendMouseReport(g_buttonMask, 0, 0, -1);
+      const int8_t wheel = (gesture == "Swipe Up") ? 1 : -1;
+      sendMouseReport(g_buttonMask, 0, 0, wheel);
     }
     return;
   }
@@ -1858,31 +1862,35 @@ void loop() {
     g_touchInterrupt = false;
     g_lastTouchEventMs = now;
     touchEdge = true;
-    if (g_inputMode == InputMode::Mouse) {
+    if (g_inputMode == InputMode::Mouse && !g_graffitiTapOnlyActive) {
       handleGestureIfAny();
     }
   }
 
-  if (g_inputMode == InputMode::Graffiti) {
-    if (g_imuReady && (now - g_lastImuPollMs) >= kGraffitiImuPollMs) {
+  if (g_imuReady) {
+    const bool airMouseActive = (g_inputMode == InputMode::Mouse) && !g_graffitiTapOnlyActive;
+    const uint32_t imuPollMs = airMouseActive ? kImuPollMs : kGraffitiImuPollMs;
+    if ((now - g_lastImuPollMs) >= imuPollMs) {
       g_lastImuPollMs = now;
-      updateImuOrientationOnly();
+      if (airMouseActive) {
+        updateAirMouse();
+      } else {
+        updateImuOrientationOnly();
+      }
     }
-    updateGraffitiTapOnlyMode();
   }
 
-  bool touchNeedsPolling = false;
-  if (g_inputMode == InputMode::Mouse) {
-    touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
-  } else {
-    // Keep release/tap detection reliable in both stroke and tap-only submodes.
-    touchNeedsPolling = touchEdge || g_touchDown || g_touchActive;
-  }
+  updateGraffitiTapOnlyMode();
 
-  const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti) ? kGraffitiTouchPollMs : kTouchPollMs;
+  const bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive || g_graffitiTapOnlyActive;
+  const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti || g_graffitiTapOnlyActive)
+                                   ? kGraffitiTouchPollMs
+                                   : kTouchPollMs;
   if (touchNeedsPolling && (now - g_lastTouchPollMs) >= touchPollMs) {
     g_lastTouchPollMs = now;
-    if (g_inputMode == InputMode::Mouse) {
+    if (g_graffitiTapOnlyActive) {
+      sampleGraffitiExitTapOnly();
+    } else if (g_inputMode == InputMode::Mouse) {
       sampleTouchState();
     } else {
       sampleGraffitiTouchState();
@@ -1893,23 +1901,24 @@ void loop() {
     g_touchActive = false;
   }
 
-  if (g_inputMode == InputMode::Mouse) {
+  if (g_inputMode == InputMode::Mouse && !g_graffitiTapOnlyActive) {
     if (g_tapArmed && static_cast<int32_t>(g_tapArmDeadlineMs - now) < 0) {
       g_tapArmed = false;
       if (!g_leftLockActive) {
         g_clickMode = "FREE";
       }
     }
+  }
 
-    if (g_imuReady && (now - g_lastImuPollMs) >= kImuPollMs) {
-      g_lastImuPollMs = now;
-      updateAirMouse();
-    }
-  } else {
-    if (g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
-      resetGraffitiTapSwitchState();
-      if (!g_touchDown) {
-        g_graffitiStatus = g_graffitiTapOnlyActive ? "EXIT TAP" : "READY";
+  if (g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
+    resetGraffitiTapSwitchState();
+    if (!g_touchDown) {
+      if (g_graffitiTapOnlyActive) {
+        g_graffitiStatus = "CMD TAP";
+      } else if (g_inputMode == InputMode::Graffiti) {
+        g_graffitiStatus = "READY";
+      } else {
+        g_graffitiStatus = "IDLE";
       }
     }
   }
