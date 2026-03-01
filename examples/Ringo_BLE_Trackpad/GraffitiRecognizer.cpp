@@ -12,8 +12,9 @@ struct TemplateDefinition {
   uint8_t anchorCount;
 };
 
+// Canonical Graffiti-1 "A" is a caret-like single stroke (^), not a printed "a".
 constexpr GraffitiRecognizer::Point kGlyphA[] = {
-    {0.20f, 0.85f}, {0.48f, 0.12f}, {0.80f, 0.85f}, {0.64f, 0.55f}, {0.36f, 0.55f},
+    {0.20f, 0.86f}, {0.50f, 0.10f}, {0.82f, 0.86f},
 };
 
 constexpr GraffitiRecognizer::Point kGlyphI[] = {
