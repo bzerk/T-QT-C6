@@ -12,6 +12,24 @@ struct TemplateDefinition {
   uint8_t anchorCount;
 };
 
+struct DirectionTemplateDefinition {
+  char symbol;
+  const char *name;
+  const uint8_t *tokens;
+  uint8_t tokenCount;
+};
+
+enum DirectionToken : uint8_t {
+  kTokR = 0,
+  kTokUR = 1,
+  kTokU = 2,
+  kTokUL = 3,
+  kTokL = 4,
+  kTokDL = 5,
+  kTokD = 6,
+  kTokDR = 7,
+};
+
 // Canonical Graffiti-1 "A" is a caret-like single stroke (^), not a printed "a".
 constexpr GraffitiRecognizer::Point kGlyphA[] = {
     {0.20f, 0.86f}, {0.50f, 0.10f}, {0.82f, 0.86f},
@@ -67,14 +85,45 @@ constexpr TemplateDefinition kTemplates[] = {
     {' ', "SPACE", kGlyphSpace, sizeof(kGlyphSpace) / sizeof(kGlyphSpace[0])},
 };
 
+constexpr uint8_t kDirA[] = {kTokUR, kTokDR};
+constexpr uint8_t kDirI[] = {kTokD};
+constexpr uint8_t kDirL[] = {kTokD, kTokR};
+constexpr uint8_t kDirN[] = {kTokU, kTokDR, kTokU};
+constexpr uint8_t kDirOCardinal[] = {kTokR, kTokD, kTokL, kTokU};
+constexpr uint8_t kDirODiagonal[] = {kTokDR, kTokDL, kTokUL, kTokUR};
+constexpr uint8_t kDirU[] = {kTokD, kTokDR, kTokUR, kTokU};
+constexpr uint8_t kDirV[] = {kTokDR, kTokUR};
+constexpr uint8_t kDirZ[] = {kTokR, kTokDL, kTokR};
+constexpr uint8_t kDirBackspace[] = {kTokL};
+constexpr uint8_t kDirSpace[] = {kTokR};
+
+constexpr DirectionTemplateDefinition kDirectionTemplates[] = {
+    {'a', "A", kDirA, sizeof(kDirA) / sizeof(kDirA[0])},
+    {'i', "I", kDirI, sizeof(kDirI) / sizeof(kDirI[0])},
+    {'l', "L", kDirL, sizeof(kDirL) / sizeof(kDirL[0])},
+    {'n', "N", kDirN, sizeof(kDirN) / sizeof(kDirN[0])},
+    {'o', "O", kDirOCardinal, sizeof(kDirOCardinal) / sizeof(kDirOCardinal[0])},
+    {'o', "O", kDirODiagonal, sizeof(kDirODiagonal) / sizeof(kDirODiagonal[0])},
+    {'u', "U", kDirU, sizeof(kDirU) / sizeof(kDirU[0])},
+    {'v', "V", kDirV, sizeof(kDirV) / sizeof(kDirV[0])},
+    {'z', "Z", kDirZ, sizeof(kDirZ) / sizeof(kDirZ[0])},
+    {'\b', "BKSP", kDirBackspace, sizeof(kDirBackspace) / sizeof(kDirBackspace[0])},
+    {' ', "SPACE", kDirSpace, sizeof(kDirSpace) / sizeof(kDirSpace[0])},
+};
+
 constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
+constexpr uint8_t kDirectionTemplateCount = sizeof(kDirectionTemplates) / sizeof(kDirectionTemplates[0]);
 constexpr float kDistanceRejectCutoff = 0.70f;
+constexpr float kDirectionRejectCutoff = 1.18f;
 }  // namespace
 
 bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Result &out) {
   if (rawPoints == nullptr || rawCount < 4) {
     return false;
   }
+
+  Result directionOut = {};
+  const bool directionOk = recognizeByDirectionSequence(rawPoints, rawCount, directionOut);
 
   static bool templatesReady = false;
   static Point templatePoints[kTemplateCount][kSamplePoints];
@@ -109,20 +158,181 @@ bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Re
   }
 
   if (bestIndex < 0) {
+    if (directionOk) {
+      out = directionOut;
+      return true;
+    }
     return false;
   }
 
-  float score = 1.0f - std::min(1.0f, (bestDistance / kDistanceRejectCutoff));
+  Result pointOut = {};
+  pointOut.symbol = kTemplates[bestIndex].symbol;
+  pointOut.name = kTemplates[bestIndex].name;
+  pointOut.score = 1.0f - std::min(1.0f, (bestDistance / kDistanceRejectCutoff));
+  pointOut.distance = bestDistance;
   const float margin = secondBest - bestDistance;
   if (margin < 0.04f) {
-    score = std::max(0.0f, score - 0.12f);
+    pointOut.score = std::max(0.0f, pointOut.score - 0.12f);
   }
 
-  out.symbol = kTemplates[bestIndex].symbol;
-  out.name = kTemplates[bestIndex].name;
+  if (directionOk && directionOut.score >= kVectorAcceptScore && directionOut.score >= pointOut.score) {
+    out = directionOut;
+  } else {
+    out = pointOut;
+  }
+  return true;
+}
+
+bool GraffitiRecognizer::recognizeByDirectionSequence(const Point *rawPoints, uint16_t rawCount, Result &out) {
+  uint8_t tokens[kMaxDirectionTokens] = {0};
+  const uint8_t tokenCount = extractDirectionTokens(rawPoints, rawCount, tokens, kMaxDirectionTokens);
+  if (tokenCount == 0) {
+    return false;
+  }
+
+  float bestDistance = FLT_MAX;
+  float secondBest = FLT_MAX;
+  int bestIndex = -1;
+
+  for (uint8_t i = 0; i < kDirectionTemplateCount; ++i) {
+    const DirectionTemplateDefinition &templ = kDirectionTemplates[i];
+    if (templ.tokenCount == 0 || templ.tokenCount > kMaxDirectionTokens) {
+      continue;
+    }
+
+    const float d = directionSequenceDistance(tokens, tokenCount, templ.tokens, templ.tokenCount);
+    if (d < bestDistance) {
+      secondBest = bestDistance;
+      bestDistance = d;
+      bestIndex = i;
+    } else if (d < secondBest) {
+      secondBest = d;
+    }
+  }
+
+  if (bestIndex < 0) {
+    return false;
+  }
+
+  float score = 1.0f - std::min(1.0f, bestDistance / kDirectionRejectCutoff);
+  const float margin = secondBest - bestDistance;
+  if (margin < 0.20f) {
+    score = std::max(0.0f, score - 0.10f);
+  }
+
+  out.symbol = kDirectionTemplates[bestIndex].symbol;
+  out.name = kDirectionTemplates[bestIndex].name;
   out.score = score;
   out.distance = bestDistance;
   return true;
+}
+
+uint8_t GraffitiRecognizer::quantizeDirection(float dx, float dy) {
+  if (!isfinite(dx) || !isfinite(dy)) {
+    return 0;
+  }
+  if ((dx * dx) + (dy * dy) < 1e-6f) {
+    return 0;
+  }
+
+  // Device coordinates are +Y downward, so negate Y for directional bins.
+  constexpr float kPi = 3.14159265358979323846f;
+  const float angle = atan2f(-dy, dx);
+  const float scaled = angle / (kPi / 4.0f);
+  int bin = static_cast<int>(lroundf(scaled));
+  bin %= 8;
+  if (bin < 0) {
+    bin += 8;
+  }
+  return static_cast<uint8_t>(bin);
+}
+
+uint8_t GraffitiRecognizer::extractDirectionTokens(const Point *input, uint16_t count, uint8_t *tokens,
+                                                   uint8_t maxTokens) {
+  if (input == nullptr || tokens == nullptr || count < 2 || maxTokens == 0) {
+    return 0;
+  }
+
+  float minX = input[0].x;
+  float minY = input[0].y;
+  float maxX = input[0].x;
+  float maxY = input[0].y;
+  for (uint16_t i = 1; i < count; ++i) {
+    minX = std::min(minX, input[i].x);
+    minY = std::min(minY, input[i].y);
+    maxX = std::max(maxX, input[i].x);
+    maxY = std::max(maxY, input[i].y);
+  }
+
+  const float width = maxX - minX;
+  const float height = maxY - minY;
+  const float diag = sqrtf((width * width) + (height * height));
+  const float minSegLen = std::max(4.0f, diag * 0.10f);
+  const float minSegLenSq = minSegLen * minSegLen;
+
+  uint8_t outCount = 0;
+  Point pivot = input[0];
+  for (uint16_t i = 1; i < count; ++i) {
+    const float dx = input[i].x - pivot.x;
+    const float dy = input[i].y - pivot.y;
+    const float d2 = (dx * dx) + (dy * dy);
+    if (d2 < minSegLenSq) {
+      continue;
+    }
+
+    const uint8_t token = quantizeDirection(dx, dy);
+    if (outCount == 0 || tokens[outCount - 1] != token) {
+      if (outCount >= maxTokens) {
+        break;
+      }
+      tokens[outCount++] = token;
+    }
+    pivot = input[i];
+  }
+
+  if (outCount == 0) {
+    const float dx = input[count - 1].x - input[0].x;
+    const float dy = input[count - 1].y - input[0].y;
+    if ((dx * dx) + (dy * dy) >= 1.0f) {
+      tokens[outCount++] = quantizeDirection(dx, dy);
+    }
+  }
+
+  return outCount;
+}
+
+float GraffitiRecognizer::directionSequenceDistance(const uint8_t *a, uint8_t aCount, const uint8_t *b,
+                                                    uint8_t bCount) {
+  if (a == nullptr || b == nullptr || aCount == 0 || bCount == 0) {
+    return FLT_MAX;
+  }
+
+  float dp[kMaxDirectionTokens + 1][kMaxDirectionTokens + 1];
+  for (uint8_t i = 0; i <= aCount; ++i) {
+    dp[i][0] = static_cast<float>(i);
+  }
+  for (uint8_t j = 0; j <= bCount; ++j) {
+    dp[0][j] = static_cast<float>(j);
+  }
+
+  for (uint8_t i = 1; i <= aCount; ++i) {
+    for (uint8_t j = 1; j <= bCount; ++j) {
+      int step = abs(static_cast<int>(a[i - 1]) - static_cast<int>(b[j - 1]));
+      step = std::min(step, 8 - step);
+      const float substCost = static_cast<float>(step) * 0.55f;
+
+      const float delCost = dp[i - 1][j] + 1.0f;
+      const float insCost = dp[i][j - 1] + 1.0f;
+      const float subCost = dp[i - 1][j - 1] + substCost;
+      dp[i][j] = std::min(subCost, std::min(delCost, insCost));
+    }
+  }
+
+  const float denom = static_cast<float>(std::max<uint8_t>(aCount, bCount));
+  if (denom <= 0.0f) {
+    return FLT_MAX;
+  }
+  return dp[aCount][bCount] / denom;
 }
 
 bool GraffitiRecognizer::prepareStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount) {

@@ -23,6 +23,14 @@ class GraffitiRecognizer {
   bool recognize(const Point *rawPoints, uint16_t rawCount, Result &out);
 
  private:
+  static constexpr uint8_t kMaxDirectionTokens = 24;
+  static constexpr float kVectorAcceptScore = 0.62f;
+
+  static bool recognizeByDirectionSequence(const Point *rawPoints, uint16_t rawCount, Result &out);
+  static uint8_t quantizeDirection(float dx, float dy);
+  static uint8_t extractDirectionTokens(const Point *input, uint16_t count, uint8_t *tokens, uint8_t maxTokens);
+  static float directionSequenceDistance(const uint8_t *a, uint8_t aCount, const uint8_t *b, uint8_t bCount);
+
   static bool prepareStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount);
   static bool resample(const Point *input, uint16_t inCount, Point *out, uint16_t outCount);
   static void normalize(Point *points, uint16_t count);
