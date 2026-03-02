@@ -935,7 +935,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -973,6 +973,11 @@ void processSerialCommand(const char *line) {
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
     Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
+    Serial.printf("[cmd] recognizer=%s trie=%lu point=%lu lastTok=%u\n",
+                  g_graffitiRecognizer.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY",
+                  static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
+                  static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
+                  g_graffitiRecognizer.lastTokenCount());
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
@@ -997,6 +1002,32 @@ void processSerialCommand(const char *line) {
     g_scrollResidual = 0.0f;
     const bool saved = saveUiConfigToNvs();
     setCommandAck(String("ok scroll=") + String(g_scrollGain, 2) + (saved ? "" : " (nosave)"));
+    return;
+  }
+  if (cmd == "recog" || cmd == "recog?" || cmd == "recog mode") {
+    setCommandAck(String("recog=") +
+                  (g_graffitiRecognizer.legacyPointFallbackEnabled() ? "hybrid" : "trie"));
+    Serial.printf("[cmd] trie=%lu point=%lu lastTok=%u\n",
+                  static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
+                  static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
+                  g_graffitiRecognizer.lastTokenCount());
+    return;
+  }
+  if (cmd == "recog trie") {
+    g_graffitiRecognizer.setLegacyPointFallbackEnabled(false);
+    g_graffitiRecognizer.resetStats();
+    setCommandAck("ok recog=trie");
+    return;
+  }
+  if (cmd == "recog hybrid") {
+    g_graffitiRecognizer.setLegacyPointFallbackEnabled(true);
+    g_graffitiRecognizer.resetStats();
+    setCommandAck("ok recog=hybrid");
+    return;
+  }
+  if (cmd == "recog reset") {
+    g_graffitiRecognizer.resetStats();
+    setCommandAck("ok recog reset");
     return;
   }
   if (cmd == "shift") {
@@ -1060,6 +1091,17 @@ String graffitiSymbolLabel(char symbol) {
   }
   char buf[2] = {symbol, '\0'};
   return String(buf);
+}
+
+const char *graffitiEngineLabel(GraffitiRecognizer::Engine engine) {
+  switch (engine) {
+    case GraffitiRecognizer::Engine::Trie:
+      return "TRIE";
+    case GraffitiRecognizer::Engine::LegacyPoint:
+      return "POINT";
+    default:
+      return "NONE";
+  }
 }
 
 bool applyGraffitiSymbol(char symbol) {
@@ -1128,11 +1170,14 @@ void finalizeGraffitiStroke() {
   if (result.score >= GraffitiRecognizer::kAcceptScore) {
     g_graffitiStatus = "ACCEPT";
     const bool keySent = applyGraffitiSymbol(result.symbol);
-    Serial.printf("[graffiti] ACCEPT %s score=%.2f kbd=%s\n", g_graffitiLastMatch.c_str(),
-                  g_graffitiLastScore, keySent ? "ok" : "skip");
+    Serial.printf("[graffiti] ACCEPT %s score=%.2f eng=%s tok=%u kbd=%s\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, graffitiEngineLabel(result.engine),
+                  result.tokenCount, keySent ? "ok" : "skip");
   } else {
     g_graffitiStatus = "REJECT";
-    Serial.printf("[graffiti] REJECT %s score=%.2f\n", g_graffitiLastMatch.c_str(), g_graffitiLastScore);
+    Serial.printf("[graffiti] REJECT %s score=%.2f eng=%s tok=%u\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, graffitiEngineLabel(result.engine),
+                  result.tokenCount);
   }
 
   resetGraffitiTapSwitchState();
@@ -1989,6 +2034,8 @@ void setup() {
     Serial.printf("[cfg] using default scroll_gain=%.2f\n", g_scrollGain);
   }
   initBleMouse();
+  Serial.printf("[graffiti] recognizer mode=%s\n",
+                g_graffitiRecognizer.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY");
 
   renderStatus(true);
 }

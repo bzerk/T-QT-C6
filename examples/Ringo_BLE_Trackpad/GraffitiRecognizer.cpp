@@ -181,7 +181,6 @@ constexpr DirectionGlyphDefinition kDirectionGlyphs[] = {
 
 constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
 constexpr uint8_t kDirectionGlyphCount = sizeof(kDirectionGlyphs) / sizeof(kDirectionGlyphs[0]);
-constexpr bool kEnableLegacyPointFallback = false;
 constexpr float kDistanceRejectCutoff = 0.70f;
 constexpr float kDirectionRejectCutoff = 1.18f;
 constexpr float kDirectionBeamMargin = 0.32f;
@@ -196,6 +195,10 @@ constexpr float kMinStrokeDiagPx = 8.0f;
 DirectionTrieNode g_directionTrie[kDirectionTrieMaxNodes];
 uint16_t g_directionTrieNodeCount = 0;
 bool g_directionTrieReady = false;
+bool g_enableLegacyPointFallback = false;
+uint32_t g_trieAcceptCount = 0;
+uint32_t g_pointAcceptCount = 0;
+uint8_t g_lastDirectionTokenCount = 0;
 }  // namespace
 
 bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Result &out) {
@@ -205,9 +208,10 @@ bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Re
 
   Result directionOut = {};
   const bool directionOk = recognizeByDirectionTrie(rawPoints, rawCount, directionOut);
-  if (!kEnableLegacyPointFallback) {
+  if (!g_enableLegacyPointFallback) {
     if (directionOk) {
       out = directionOut;
+      g_trieAcceptCount++;
       return true;
     }
     return false;
@@ -258,6 +262,8 @@ bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Re
   pointOut.name = kTemplates[bestIndex].name;
   pointOut.score = 1.0f - std::min(1.0f, (bestDistance / kDistanceRejectCutoff));
   pointOut.distance = bestDistance;
+  pointOut.engine = Engine::LegacyPoint;
+  pointOut.tokenCount = 0;
   const float margin = secondBest - bestDistance;
   if (margin < 0.04f) {
     pointOut.score = std::max(0.0f, pointOut.score - 0.12f);
@@ -265,8 +271,10 @@ bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Re
 
   if (directionOk && directionOut.score >= kVectorAcceptScore && directionOut.score >= pointOut.score) {
     out = directionOut;
+    g_trieAcceptCount++;
   } else {
     out = pointOut;
+    g_pointAcceptCount++;
   }
   return true;
 }
@@ -392,6 +400,7 @@ bool GraffitiRecognizer::recognizeByDirectionTrie(const Point *rawPoints, uint16
 
   uint8_t tokens[kMaxDirectionTokens] = {0};
   const uint8_t tokenCount = extractDirectionTokens(rawPoints, rawCount, tokens, kMaxDirectionTokens);
+  g_lastDirectionTokenCount = tokenCount;
   if (tokenCount == 0) {
     return false;
   }
@@ -420,6 +429,8 @@ bool GraffitiRecognizer::recognizeByDirectionTrie(const Point *rawPoints, uint16
   out.name = kDirectionGlyphs[bestEntry].name;
   out.score = score;
   out.distance = bestCost;
+  out.engine = Engine::Trie;
+  out.tokenCount = tokenCount;
   return true;
 }
 
@@ -685,4 +696,30 @@ float GraffitiRecognizer::distance(const Point &a, const Point &b) {
   const float dx = a.x - b.x;
   const float dy = a.y - b.y;
   return sqrtf((dx * dx) + (dy * dy));
+}
+
+void GraffitiRecognizer::setLegacyPointFallbackEnabled(bool enabled) {
+  g_enableLegacyPointFallback = enabled;
+}
+
+bool GraffitiRecognizer::legacyPointFallbackEnabled() const {
+  return g_enableLegacyPointFallback;
+}
+
+uint32_t GraffitiRecognizer::trieAcceptCount() const {
+  return g_trieAcceptCount;
+}
+
+uint32_t GraffitiRecognizer::pointAcceptCount() const {
+  return g_pointAcceptCount;
+}
+
+uint8_t GraffitiRecognizer::lastTokenCount() const {
+  return g_lastDirectionTokenCount;
+}
+
+void GraffitiRecognizer::resetStats() {
+  g_trieAcceptCount = 0;
+  g_pointAcceptCount = 0;
+  g_lastDirectionTokenCount = 0;
 }

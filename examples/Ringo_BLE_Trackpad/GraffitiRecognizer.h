@@ -5,6 +5,12 @@
 
 class GraffitiRecognizer {
  public:
+  enum class Engine : uint8_t {
+    None = 0,
+    Trie = 1,
+    LegacyPoint = 2,
+  };
+
   struct Point {
     float x;
     float y;
@@ -15,12 +21,20 @@ class GraffitiRecognizer {
     const char *name;
     float score;
     float distance;
+    Engine engine;
+    uint8_t tokenCount;
   };
 
   static constexpr uint8_t kSamplePoints = 32;
   static constexpr float kAcceptScore = 0.58f;
 
   bool recognize(const Point *rawPoints, uint16_t rawCount, Result &out);
+  void setLegacyPointFallbackEnabled(bool enabled);
+  bool legacyPointFallbackEnabled() const;
+  uint32_t trieAcceptCount() const;
+  uint32_t pointAcceptCount() const;
+  uint8_t lastTokenCount() const;
+  void resetStats();
 
  private:
   static constexpr uint8_t kMaxDirectionTokens = 24;
