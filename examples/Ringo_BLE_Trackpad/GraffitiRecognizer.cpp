@@ -183,11 +183,15 @@ constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
 constexpr uint8_t kDirectionGlyphCount = sizeof(kDirectionGlyphs) / sizeof(kDirectionGlyphs[0]);
 constexpr bool kEnableLegacyPointFallback = false;
 constexpr float kDistanceRejectCutoff = 0.70f;
-constexpr float kDirectionRejectCutoff = 1.40f;
-constexpr float kDirectionBeamMargin = 0.42f;
+constexpr float kDirectionRejectCutoff = 1.18f;
+constexpr float kDirectionBeamMargin = 0.32f;
 constexpr float kDirectionHardPrune = 2.40f;
 constexpr uint16_t kDirectionTrieMaxNodes = 512;
 constexpr int16_t kNoTrieNode = -1;
+constexpr float kDirectionStartPenalty = 0.22f;
+constexpr float kDirectionEndPenalty = 0.16f;
+constexpr float kDirectionLengthPenalty = 0.12f;
+constexpr float kMinStrokeDiagPx = 8.0f;
 
 DirectionTrieNode g_directionTrie[kDirectionTrieMaxNodes];
 uint16_t g_directionTrieNodeCount = 0;
@@ -351,8 +355,21 @@ void GraffitiRecognizer::searchDirectionTrieNode(uint16_t nodeIndex, const uint8
 
     const DirectionTrieNode &child = g_directionTrie[childIndex];
     if (child.terminalGlyph >= 0) {
-      const float candidateCost =
+      const DirectionGlyphDefinition &glyph = kDirectionGlyphs[child.terminalGlyph];
+      float candidateCost =
           nextRow[inputCount] / static_cast<float>(std::max<uint8_t>(inputCount, child.depth));
+      if (glyph.tokenCount > 0 && inputCount > 0) {
+        int startStep = abs(static_cast<int>(inputTokens[0] & 0x07) -
+                            static_cast<int>(glyph.tokens[0] & 0x07));
+        startStep = std::min(startStep, 8 - startStep);
+        int endStep = abs(static_cast<int>(inputTokens[inputCount - 1] & 0x07) -
+                          static_cast<int>(glyph.tokens[glyph.tokenCount - 1] & 0x07));
+        endStep = std::min(endStep, 8 - endStep);
+        const int lenDiff = abs(static_cast<int>(inputCount) - static_cast<int>(glyph.tokenCount));
+        candidateCost += (kDirectionStartPenalty * static_cast<float>(startStep));
+        candidateCost += (kDirectionEndPenalty * static_cast<float>(endStep));
+        candidateCost += (kDirectionLengthPenalty * static_cast<float>(lenDiff));
+      }
       if (candidateCost < bestCost) {
         secondCost = bestCost;
         bestCost = candidateCost;
@@ -446,7 +463,10 @@ uint8_t GraffitiRecognizer::extractDirectionTokens(const Point *input, uint16_t 
   const float width = maxX - minX;
   const float height = maxY - minY;
   const float diag = sqrtf((width * width) + (height * height));
-  const float minSegLen = std::max(1.5f, diag * 0.03f);
+  if (diag < kMinStrokeDiagPx) {
+    return 0;
+  }
+  const float minSegLen = std::max(2.0f, diag * 0.05f);
   const float minSegLenSq = minSegLen * minSegLen;
 
   uint8_t outCount = 0;
