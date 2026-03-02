@@ -973,11 +973,12 @@ void processSerialCommand(const char *line) {
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
     Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
-    Serial.printf("[cmd] recognizer=%s trie=%lu point=%lu lastTok=%u\n",
+    Serial.printf("[cmd] recognizer=%s trie=%lu point=%lu lastTok=%u seq=%s\n",
                   g_graffitiRecognizer.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY",
                   static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
-                  g_graffitiRecognizer.lastTokenCount());
+                  g_graffitiRecognizer.lastTokenCount(),
+                  g_graffitiRecognizer.lastTokenSequence());
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
@@ -1007,10 +1008,11 @@ void processSerialCommand(const char *line) {
   if (cmd == "recog" || cmd == "recog?" || cmd == "recog mode") {
     setCommandAck(String("recog=") +
                   (g_graffitiRecognizer.legacyPointFallbackEnabled() ? "hybrid" : "trie"));
-    Serial.printf("[cmd] trie=%lu point=%lu lastTok=%u\n",
+    Serial.printf("[cmd] trie=%lu point=%lu lastTok=%u seq=%s\n",
                   static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
-                  g_graffitiRecognizer.lastTokenCount());
+                  g_graffitiRecognizer.lastTokenCount(),
+                  g_graffitiRecognizer.lastTokenSequence());
     return;
   }
   if (cmd == "recog trie") {
@@ -1170,14 +1172,17 @@ void finalizeGraffitiStroke() {
   if (result.score >= GraffitiRecognizer::kAcceptScore) {
     g_graffitiStatus = "ACCEPT";
     const bool keySent = applyGraffitiSymbol(result.symbol);
-    Serial.printf("[graffiti] ACCEPT %s score=%.2f eng=%s tok=%u kbd=%s\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, graffitiEngineLabel(result.engine),
-                  result.tokenCount, keySent ? "ok" : "skip");
+    Serial.printf("[graffiti] ACCEPT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s kbd=%s\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.distance,
+                  graffitiEngineLabel(result.engine), result.tokenCount,
+                  g_graffitiRecognizer.lastTokenSequence(),
+                  keySent ? "ok" : "skip");
   } else {
     g_graffitiStatus = "REJECT";
-    Serial.printf("[graffiti] REJECT %s score=%.2f eng=%s tok=%u\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, graffitiEngineLabel(result.engine),
-                  result.tokenCount);
+    Serial.printf("[graffiti] REJECT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.distance,
+                  graffitiEngineLabel(result.engine), result.tokenCount,
+                  g_graffitiRecognizer.lastTokenSequence());
   }
 
   resetGraffitiTapSwitchState();

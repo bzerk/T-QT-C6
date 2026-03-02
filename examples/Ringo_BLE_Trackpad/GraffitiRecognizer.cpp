@@ -182,15 +182,17 @@ constexpr DirectionGlyphDefinition kDirectionGlyphs[] = {
 constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
 constexpr uint8_t kDirectionGlyphCount = sizeof(kDirectionGlyphs) / sizeof(kDirectionGlyphs[0]);
 constexpr float kDistanceRejectCutoff = 0.70f;
-constexpr float kDirectionRejectCutoff = 1.18f;
-constexpr float kDirectionBeamMargin = 0.32f;
-constexpr float kDirectionHardPrune = 2.40f;
+constexpr float kDirectionRejectCutoff = 1.45f;
+constexpr float kDirectionBeamMargin = 0.36f;
+constexpr float kDirectionHardPrune = 2.60f;
 constexpr uint16_t kDirectionTrieMaxNodes = 512;
 constexpr int16_t kNoTrieNode = -1;
-constexpr float kDirectionStartPenalty = 0.22f;
-constexpr float kDirectionEndPenalty = 0.16f;
-constexpr float kDirectionLengthPenalty = 0.12f;
-constexpr float kMinStrokeDiagPx = 8.0f;
+constexpr float kDirectionStartPenalty = 0.14f;
+constexpr float kDirectionEndPenalty = 0.10f;
+constexpr float kDirectionLengthPenalty = 0.08f;
+constexpr float kDirectionDigitBiasPenalty = 0.14f;
+constexpr float kDirectionControlBiasPenalty = 0.16f;
+constexpr float kMinStrokeDiagPx = 6.5f;
 
 DirectionTrieNode g_directionTrie[kDirectionTrieMaxNodes];
 uint16_t g_directionTrieNodeCount = 0;
@@ -199,6 +201,7 @@ bool g_enableLegacyPointFallback = false;
 uint32_t g_trieAcceptCount = 0;
 uint32_t g_pointAcceptCount = 0;
 uint8_t g_lastDirectionTokenCount = 0;
+char g_lastDirectionTokenSequence[96] = "NONE";
 }  // namespace
 
 bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Result &out) {
@@ -329,10 +332,146 @@ void GraffitiRecognizer::buildDirectionTrie() {
   g_directionTrieReady = true;
 }
 
+uint8_t directionStepDistance(uint8_t a, uint8_t b) {
+  int step = abs(static_cast<int>(a & 0x07) - static_cast<int>(b & 0x07));
+  step = std::min(step, 8 - step);
+  return static_cast<uint8_t>(step);
+}
+
+bool isControlSymbol(char symbol) {
+  return (symbol == ' ' || symbol == '\n' || symbol == '\r' || symbol == '\b');
+}
+
+const char *directionTokenName(uint8_t token) {
+  switch (token & 0x07) {
+    case kTokR:
+      return "R";
+    case kTokUR:
+      return "UR";
+    case kTokU:
+      return "U";
+    case kTokUL:
+      return "UL";
+    case kTokL:
+      return "L";
+    case kTokDL:
+      return "DL";
+    case kTokD:
+      return "D";
+    case kTokDR:
+      return "DR";
+    default:
+      return "?";
+  }
+}
+
+void formatDirectionTokens(const uint8_t *tokens, uint8_t count, char *out, size_t outLen) {
+  if (out == nullptr || outLen == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (tokens == nullptr || count == 0) {
+    snprintf(out, outLen, "NONE");
+    return;
+  }
+
+  size_t used = 0;
+  for (uint8_t i = 0; i < count && used < (outLen - 1); ++i) {
+    const char *sep = (i == 0) ? "" : "-";
+    const char *name = directionTokenName(tokens[i]);
+    const int wrote = snprintf(out + used, outLen - used, "%s%s", sep, name);
+    if (wrote <= 0) {
+      break;
+    }
+    if (static_cast<size_t>(wrote) >= (outLen - used)) {
+      used = outLen - 1;
+      break;
+    }
+    used += static_cast<size_t>(wrote);
+  }
+}
+
+uint8_t smoothDirectionTokens(uint8_t *tokens, float *lengths, uint8_t count, float diag) {
+  if (tokens == nullptr || lengths == nullptr || count <= 1) {
+    return count;
+  }
+
+  const float minorTurnLen = std::max(1.5f, diag * 0.11f);
+  const float bounceLen = std::max(2.0f, diag * 0.16f);
+
+  // Pass 1: absorb very short near-collinear turns into neighboring runs.
+  uint8_t write = 0;
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint8_t token = tokens[i] & 0x07;
+    const float len = lengths[i];
+    if (write == 0) {
+      tokens[write] = token;
+      lengths[write] = len;
+      ++write;
+      continue;
+    }
+
+    const uint8_t prevToken = tokens[write - 1];
+    if (prevToken == token) {
+      lengths[write - 1] += len;
+      continue;
+    }
+
+    const uint8_t step = directionStepDistance(prevToken, token);
+    if (step <= 1 && len < minorTurnLen) {
+      lengths[write - 1] += len;
+      continue;
+    }
+
+    tokens[write] = token;
+    lengths[write] = len;
+    ++write;
+  }
+  count = write;
+  if (count <= 1) {
+    return count;
+  }
+
+  // Pass 2: remove short A-B-A bounces that come from touchscreen jitter.
+  bool changed = true;
+  while (changed && count >= 3) {
+    changed = false;
+    for (uint8_t i = 1; i < (count - 1); ++i) {
+      if (tokens[i - 1] != tokens[i + 1]) {
+        continue;
+      }
+      if (lengths[i] > bounceLen) {
+        continue;
+      }
+
+      lengths[i - 1] += lengths[i];
+      for (uint8_t j = i; j < (count - 1); ++j) {
+        tokens[j] = tokens[j + 1];
+        lengths[j] = lengths[j + 1];
+      }
+      --count;
+
+      if (i < count && tokens[i - 1] == tokens[i]) {
+        lengths[i - 1] += lengths[i];
+        for (uint8_t j = i; j < (count - 1); ++j) {
+          tokens[j] = tokens[j + 1];
+          lengths[j] = lengths[j + 1];
+        }
+        --count;
+      }
+
+      changed = true;
+      break;
+    }
+  }
+
+  return count;
+}
+
 float GraffitiRecognizer::directionSubstitutionCost(uint8_t inputToken, uint8_t templateToken) {
   int step = abs(static_cast<int>(inputToken & 0x07) - static_cast<int>(templateToken & 0x07));
   step = std::min(step, 8 - step);
-  return static_cast<float>(step) * 0.52f;
+  return static_cast<float>(step) * 0.42f;
 }
 
 void GraffitiRecognizer::searchDirectionTrieNode(uint16_t nodeIndex, const uint8_t *inputTokens,
@@ -378,6 +517,11 @@ void GraffitiRecognizer::searchDirectionTrieNode(uint16_t nodeIndex, const uint8
         candidateCost += (kDirectionEndPenalty * static_cast<float>(endStep));
         candidateCost += (kDirectionLengthPenalty * static_cast<float>(lenDiff));
       }
+      if (glyph.symbol >= '0' && glyph.symbol <= '9') {
+        candidateCost += kDirectionDigitBiasPenalty;
+      } else if (isControlSymbol(glyph.symbol)) {
+        candidateCost += kDirectionControlBiasPenalty;
+      }
       if (candidateCost < bestCost) {
         secondCost = bestCost;
         bestCost = candidateCost;
@@ -401,6 +545,7 @@ bool GraffitiRecognizer::recognizeByDirectionTrie(const Point *rawPoints, uint16
   uint8_t tokens[kMaxDirectionTokens] = {0};
   const uint8_t tokenCount = extractDirectionTokens(rawPoints, rawCount, tokens, kMaxDirectionTokens);
   g_lastDirectionTokenCount = tokenCount;
+  formatDirectionTokens(tokens, tokenCount, g_lastDirectionTokenSequence, sizeof(g_lastDirectionTokenSequence));
   if (tokenCount == 0) {
     return false;
   }
@@ -477,25 +622,60 @@ uint8_t GraffitiRecognizer::extractDirectionTokens(const Point *input, uint16_t 
   if (diag < kMinStrokeDiagPx) {
     return 0;
   }
-  const float minSegLen = std::max(2.0f, diag * 0.05f);
-  const float minSegLenSq = minSegLen * minSegLen;
+  const float minSegLen = std::max(1.6f, diag * 0.040f);
+  uint8_t rawTokens[kMaxDirectionTokens] = {0};
+  float rawLengths[kMaxDirectionTokens] = {0.0f};
+  uint8_t rawCount = 0;
+  float accDx = 0.0f;
+  float accDy = 0.0f;
+  float accLen = 0.0f;
 
-  uint8_t outCount = 0;
   for (uint16_t i = 1; i < count; ++i) {
     const float dx = input[i].x - input[i - 1].x;
     const float dy = input[i].y - input[i - 1].y;
     const float d2 = (dx * dx) + (dy * dy);
-    if (d2 < minSegLenSq) {
+    if (d2 < 0.09f) {
       continue;
     }
 
-    const uint8_t token = quantizeDirection(dx, dy);
-    if (outCount == 0 || tokens[outCount - 1] != token) {
-      if (outCount >= maxTokens) {
-        break;
-      }
-      tokens[outCount++] = token;
+    const float d = sqrtf(d2);
+    accDx += dx;
+    accDy += dy;
+    accLen += d;
+    if (accLen < minSegLen) {
+      continue;
     }
+
+    const uint8_t token = quantizeDirection(accDx, accDy);
+    if (rawCount > 0 && rawTokens[rawCount - 1] == token) {
+      rawLengths[rawCount - 1] += accLen;
+    } else if (rawCount < kMaxDirectionTokens) {
+      rawTokens[rawCount] = token;
+      rawLengths[rawCount] = accLen;
+      ++rawCount;
+    } else {
+      break;
+    }
+    accDx = 0.0f;
+    accDy = 0.0f;
+    accLen = 0.0f;
+  }
+
+  if (accLen >= (minSegLen * 0.60f)) {
+    const uint8_t token = quantizeDirection(accDx, accDy);
+    if (rawCount > 0 && rawTokens[rawCount - 1] == token) {
+      rawLengths[rawCount - 1] += accLen;
+    } else if (rawCount < kMaxDirectionTokens) {
+      rawTokens[rawCount] = token;
+      rawLengths[rawCount] = accLen;
+      ++rawCount;
+    }
+  }
+
+  uint8_t outCount = smoothDirectionTokens(rawTokens, rawLengths, rawCount, diag);
+  outCount = std::min(outCount, maxTokens);
+  for (uint8_t i = 0; i < outCount; ++i) {
+    tokens[i] = rawTokens[i];
   }
 
   // If the stroke collapsed to one direction, attempt a corner split to recover
@@ -718,8 +898,13 @@ uint8_t GraffitiRecognizer::lastTokenCount() const {
   return g_lastDirectionTokenCount;
 }
 
+const char *GraffitiRecognizer::lastTokenSequence() const {
+  return g_lastDirectionTokenSequence;
+}
+
 void GraffitiRecognizer::resetStats() {
   g_trieAcceptCount = 0;
   g_pointAcceptCount = 0;
   g_lastDirectionTokenCount = 0;
+  snprintf(g_lastDirectionTokenSequence, sizeof(g_lastDirectionTokenSequence), "NONE");
 }

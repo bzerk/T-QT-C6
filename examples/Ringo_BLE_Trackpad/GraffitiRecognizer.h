@@ -26,7 +26,7 @@ class GraffitiRecognizer {
   };
 
   static constexpr uint8_t kSamplePoints = 32;
-  static constexpr float kAcceptScore = 0.58f;
+  static constexpr float kAcceptScore = 0.52f;
 
   bool recognize(const Point *rawPoints, uint16_t rawCount, Result &out);
   void setLegacyPointFallbackEnabled(bool enabled);
@@ -34,11 +34,12 @@ class GraffitiRecognizer {
   uint32_t trieAcceptCount() const;
   uint32_t pointAcceptCount() const;
   uint8_t lastTokenCount() const;
+  const char *lastTokenSequence() const;
   void resetStats();
 
  private:
   static constexpr uint8_t kMaxDirectionTokens = 24;
-  static constexpr float kVectorAcceptScore = 0.62f;
+  static constexpr float kVectorAcceptScore = 0.56f;
   static constexpr uint16_t kMaxDirectionTrieNodes = 512;
 
   static bool recognizeByDirectionTrie(const Point *rawPoints, uint16_t rawCount, Result &out);
