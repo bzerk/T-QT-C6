@@ -83,6 +83,13 @@ constexpr char kGyroBiasNvsNamespace[] = "ringo_imu";
 constexpr char kGyroBiasNvsKey[] = "gyro_bias";
 constexpr uint32_t kGyroBiasRecordMagic = 0x52424759;  // "RGBY"
 constexpr uint16_t kGyroBiasRecordVersion = 1;
+constexpr char kUiCfgNvsNamespace[] = "ringo_ui";
+constexpr char kUiCfgNvsKey[] = "mouse_cfg";
+constexpr uint32_t kUiCfgRecordMagic = 0x52435549;  // "RCUI"
+constexpr uint16_t kUiCfgRecordVersion = 1;
+constexpr float kDefaultScrollGain = 0.70f;
+constexpr float kMinScrollGain = 0.10f;
+constexpr float kMaxScrollGain = 2.00f;
 constexpr uint32_t kAutoBiasMinStillMs = 3500;
 constexpr uint16_t kAutoBiasMinSamples = 100;
 constexpr float kAutoBiasStillRateDps = 1.1f;
@@ -138,6 +145,8 @@ float g_yawRateDps = 0.0f;
 float g_pitchRateDps = 0.0f;
 float g_rollRateDps = 0.0f;
 float g_rollDamp = 1.0f;
+float g_scrollGain = kDefaultScrollGain;
+float g_scrollResidual = 0.0f;
 
 uint8_t g_buttonMask = 0;
 bool g_leftLockActive = false;
@@ -190,8 +199,11 @@ uint32_t g_lastBiasSaveMs = 0;
 void renderStatus(bool force = false);
 void updateImuOrientationOnly();
 struct ImuSample;
+void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel);
 bool loadGyroBiasFromNvs();
 bool saveGyroBiasToNvs();
+bool loadUiConfigFromNvs();
+bool saveUiConfigToNvs();
 void resetStationaryBiasEstimator();
 void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps);
 bool recalibrateGyroBias(bool persistBias);
@@ -245,6 +257,13 @@ struct GyroBiasRecord {
   float biasZ_mdps;
 };
 
+struct UiConfigRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  float scrollGain;
+};
+
 class ServerCallbacks final : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     (void)server;
@@ -276,6 +295,39 @@ class ServerCallbacks final : public BLEServerCallbacks {
 int8_t clampToInt8(int value) {
   value = std::max(-127, std::min(127, value));
   return static_cast<int8_t>(value);
+}
+
+float clampScrollGain(float gain) {
+  if (!isfinite(gain)) {
+    return kDefaultScrollGain;
+  }
+  return std::max(kMinScrollGain, std::min(kMaxScrollGain, gain));
+}
+
+void sendWheelTicks(int8_t wheel, uint8_t count) {
+  if (wheel == 0 || count == 0) {
+    return;
+  }
+  for (uint8_t i = 0; i < count; ++i) {
+    sendMouseReport(g_buttonMask, 0, 0, wheel);
+    delay(2);
+  }
+}
+
+void emitScaledWheel(float wheelUnits) {
+  if (!isfinite(wheelUnits) || fabsf(wheelUnits) < 1e-4f) {
+    return;
+  }
+
+  g_scrollResidual += wheelUnits * g_scrollGain;
+  const int steps = static_cast<int>(truncf(g_scrollResidual));
+  if (steps == 0) {
+    return;
+  }
+
+  const int clamped = std::max(-6, std::min(6, steps));
+  g_scrollResidual -= static_cast<float>(clamped);
+  sendWheelTicks(clamped > 0 ? 1 : -1, static_cast<uint8_t>(abs(clamped)));
 }
 
 void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel = 0) {
@@ -507,6 +559,62 @@ bool loadGyroBiasFromNvs() {
   g_gyroBiasZ = record.biasZ_mdps;
   g_lastBiasSaveMs = millis();
   Serial.printf("[imu] Bias loaded from NVS: x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+  return true;
+}
+
+bool saveUiConfigToNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kUiCfgNvsNamespace, false)) {
+    Serial.println("[cfg] NVS open failed (write)");
+    return false;
+  }
+
+  UiConfigRecord record = {
+      kUiCfgRecordMagic,
+      kUiCfgRecordVersion,
+      0,
+      clampScrollGain(g_scrollGain),
+  };
+  const size_t written = prefs.putBytes(kUiCfgNvsKey, &record, sizeof(record));
+  prefs.end();
+  if (written != sizeof(record)) {
+    Serial.println("[cfg] NVS save failed");
+    return false;
+  }
+
+  Serial.printf("[cfg] saved scroll_gain=%.2f\n", record.scrollGain);
+  return true;
+}
+
+bool loadUiConfigFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kUiCfgNvsNamespace, true)) {
+    Serial.println("[cfg] NVS open failed (read)");
+    return false;
+  }
+
+  const size_t storedLen = prefs.getBytesLength(kUiCfgNvsKey);
+  if (storedLen != sizeof(UiConfigRecord)) {
+    prefs.end();
+    return false;
+  }
+
+  UiConfigRecord record;
+  const size_t readLen = prefs.getBytes(kUiCfgNvsKey, &record, sizeof(record));
+  prefs.end();
+  if (readLen != sizeof(record)) {
+    return false;
+  }
+
+  if (record.magic != kUiCfgRecordMagic || record.version != kUiCfgRecordVersion) {
+    return false;
+  }
+  if (!isfinite(record.scrollGain)) {
+    return false;
+  }
+
+  g_scrollGain = clampScrollGain(record.scrollGain);
+  Serial.printf("[cfg] loaded scroll_gain=%.2f\n", g_scrollGain);
   return true;
 }
 
@@ -769,6 +877,7 @@ void resetInputTransientState() {
   g_airVelY = 0.0f;
   g_airResidualX = 0.0f;
   g_airResidualY = 0.0f;
+  g_scrollResidual = 0.0f;
   g_lastDeltaX = 0;
   g_lastDeltaY = 0;
   resetGraffitiTapSwitchState();
@@ -826,7 +935,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -863,11 +972,31 @@ void processSerialCommand(const char *line) {
                   g_graffitiStrokeCount, g_graffitiLastStrokePoints,
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+    Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
     const bool ok = recalibrateGyroBias(true);
     setCommandAck(ok ? "ok cal" : "err cal");
+    return;
+  }
+  if (cmd == "scroll" || cmd == "scroll?" || cmd == "scroll get") {
+    setCommandAck(String("scroll=") + String(g_scrollGain, 2));
+    return;
+  }
+  if (cmd.startsWith("scroll ")) {
+    String arg = cmd.substring(7);
+    arg.trim();
+    const float parsed = arg.toFloat();
+    if (!arg.length() || (parsed == 0.0f && arg != "0" && arg != "0.0")) {
+      setCommandAck("err scroll parse");
+      return;
+    }
+
+    g_scrollGain = clampScrollGain(parsed);
+    g_scrollResidual = 0.0f;
+    const bool saved = saveUiConfigToNvs();
+    setCommandAck(String("ok scroll=") + String(g_scrollGain, 2) + (saved ? "" : " (nosave)"));
     return;
   }
   if (cmd == "shift") {
@@ -1605,8 +1734,8 @@ void handleGestureIfAny() {
     if (gesture == "Swipe Up" || gesture == "Swipe Down") {
       g_tapArmed = false;
       g_swipeHandledThisTouch = true;
-      const int8_t wheel = (gesture == "Swipe Up") ? 1 : -1;
-      sendMouseReport(g_buttonMask, 0, 0, wheel);
+      const float wheelUnits = (gesture == "Swipe Up") ? 1.0f : -1.0f;
+      emitScaledWheel(wheelUnits);
     }
     return;
   }
@@ -1639,12 +1768,9 @@ void sampleTouchState() {
           !g_touchLongActionFired &&
           pressDuration <= kTouchSwipeMaxDurationMs &&
           absDy >= kTouchSwipeMinDistancePx && absDy > (absDx + 8)) {
-        const int8_t wheelStep = (deltaY < 0) ? 1 : -1;
-        uint8_t steps = static_cast<uint8_t>(std::min<int16_t>(3, std::max<int16_t>(1, absDy / 28)));
-        for (uint8_t i = 0; i < steps; ++i) {
-          sendMouseReport(g_buttonMask, 0, 0, wheelStep);
-          delay(3);
-        }
+        const float wheelSign = (deltaY < 0) ? 1.0f : -1.0f;
+        const float rawSteps = static_cast<float>(std::min<int16_t>(3, std::max<int16_t>(1, absDy / 28)));
+        emitScaledWheel(wheelSign * rawSteps);
         g_tapArmed = false;
         g_lastGesture = (deltaY < 0) ? "Swipe Up" : "Swipe Down";
         handledOnRelease = true;
@@ -1858,6 +1984,10 @@ void setup() {
   initBoardPowerAndDisplay();
   initTouch();
   initImu();
+  if (!loadUiConfigFromNvs()) {
+    g_scrollGain = kDefaultScrollGain;
+    Serial.printf("[cfg] using default scroll_gain=%.2f\n", g_scrollGain);
+  }
   initBleMouse();
 
   renderStatus(true);
