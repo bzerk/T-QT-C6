@@ -177,6 +177,7 @@ constexpr DirectionGlyphDefinition kDirectionGlyphs[] = {
 
 constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
 constexpr uint8_t kDirectionGlyphCount = sizeof(kDirectionGlyphs) / sizeof(kDirectionGlyphs[0]);
+constexpr bool kEnableLegacyPointFallback = false;
 constexpr float kDistanceRejectCutoff = 0.70f;
 constexpr float kDirectionRejectCutoff = 1.28f;
 constexpr float kDirectionBeamMargin = 0.42f;
@@ -196,6 +197,13 @@ bool GraffitiRecognizer::recognize(const Point *rawPoints, uint16_t rawCount, Re
 
   Result directionOut = {};
   const bool directionOk = recognizeByDirectionTrie(rawPoints, rawCount, directionOut);
+  if (!kEnableLegacyPointFallback) {
+    if (directionOk) {
+      out = directionOut;
+      return true;
+    }
+    return false;
+  }
 
   static bool templatesReady = false;
   static Point templatePoints[kTemplateCount][kSamplePoints];
