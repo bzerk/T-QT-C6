@@ -92,6 +92,8 @@ constexpr TemplateDefinition kTemplates[] = {
 };
 
 constexpr uint8_t kDirA[] = {kTokUR, kTokDR};
+constexpr uint8_t kDirA2[] = {kTokU, kTokDR};
+constexpr uint8_t kDirA3[] = {kTokUR, kTokD, kTokDR};
 constexpr uint8_t kDirB[] = {kTokD, kTokUR, kTokDR, kTokDL};
 constexpr uint8_t kDirC[] = {kTokUR, kTokUL, kTokDL, kTokDR};
 constexpr uint8_t kDirD[] = {kTokD, kTokUR, kTokDR, kTokDL, kTokU};
@@ -135,6 +137,8 @@ constexpr uint8_t kDirReturn[] = {kTokDL};
 
 constexpr DirectionGlyphDefinition kDirectionGlyphs[] = {
     {'a', "A", kDirA, sizeof(kDirA) / sizeof(kDirA[0])},
+    {'a', "A", kDirA2, sizeof(kDirA2) / sizeof(kDirA2[0])},
+    {'a', "A", kDirA3, sizeof(kDirA3) / sizeof(kDirA3[0])},
     {'b', "B", kDirB, sizeof(kDirB) / sizeof(kDirB[0])},
     {'c', "C", kDirC, sizeof(kDirC) / sizeof(kDirC[0])},
     {'d', "D", kDirD, sizeof(kDirD) / sizeof(kDirD[0])},
@@ -179,7 +183,7 @@ constexpr uint8_t kTemplateCount = sizeof(kTemplates) / sizeof(kTemplates[0]);
 constexpr uint8_t kDirectionGlyphCount = sizeof(kDirectionGlyphs) / sizeof(kDirectionGlyphs[0]);
 constexpr bool kEnableLegacyPointFallback = false;
 constexpr float kDistanceRejectCutoff = 0.70f;
-constexpr float kDirectionRejectCutoff = 1.28f;
+constexpr float kDirectionRejectCutoff = 1.40f;
 constexpr float kDirectionBeamMargin = 0.42f;
 constexpr float kDirectionHardPrune = 2.40f;
 constexpr uint16_t kDirectionTrieMaxNodes = 512;
@@ -391,7 +395,8 @@ bool GraffitiRecognizer::recognizeByDirectionTrie(const Point *rawPoints, uint16
   float score = 1.0f - std::min(1.0f, bestCost / kDirectionRejectCutoff);
   const float margin = secondCost - bestCost;
   if (margin < 0.18f) {
-    score = std::max(0.0f, score - 0.12f);
+    const float ambiguityPenalty = (tokenCount <= 3) ? 0.06f : 0.12f;
+    score = std::max(0.0f, score - ambiguityPenalty);
   }
 
   out.symbol = kDirectionGlyphs[bestEntry].symbol;
@@ -441,14 +446,13 @@ uint8_t GraffitiRecognizer::extractDirectionTokens(const Point *input, uint16_t 
   const float width = maxX - minX;
   const float height = maxY - minY;
   const float diag = sqrtf((width * width) + (height * height));
-  const float minSegLen = std::max(4.0f, diag * 0.10f);
+  const float minSegLen = std::max(1.5f, diag * 0.03f);
   const float minSegLenSq = minSegLen * minSegLen;
 
   uint8_t outCount = 0;
-  Point pivot = input[0];
   for (uint16_t i = 1; i < count; ++i) {
-    const float dx = input[i].x - pivot.x;
-    const float dy = input[i].y - pivot.y;
+    const float dx = input[i].x - input[i - 1].x;
+    const float dy = input[i].y - input[i - 1].y;
     const float d2 = (dx * dx) + (dy * dy);
     if (d2 < minSegLenSq) {
       continue;
@@ -461,7 +465,48 @@ uint8_t GraffitiRecognizer::extractDirectionTokens(const Point *input, uint16_t 
       }
       tokens[outCount++] = token;
     }
-    pivot = input[i];
+  }
+
+  // If the stroke collapsed to one direction, attempt a corner split to recover
+  // caret-like or V-like gestures from sparse samples.
+  if (outCount <= 1 && count >= 3) {
+    const Point &start = input[0];
+    const Point &end = input[count - 1];
+    const float vx = end.x - start.x;
+    const float vy = end.y - start.y;
+    const float vv = (vx * vx) + (vy * vy);
+    if (vv > 1e-3f) {
+      float bestPerpSq = 0.0f;
+      uint16_t bestIdx = 0;
+      for (uint16_t i = 1; i < (count - 1); ++i) {
+        const float wx = input[i].x - start.x;
+        const float wy = input[i].y - start.y;
+        float t = ((wx * vx) + (wy * vy)) / vv;
+        t = std::max(0.0f, std::min(1.0f, t));
+        const float projX = start.x + (t * vx);
+        const float projY = start.y + (t * vy);
+        const float px = input[i].x - projX;
+        const float py = input[i].y - projY;
+        const float perpSq = (px * px) + (py * py);
+        if (perpSq > bestPerpSq) {
+          bestPerpSq = perpSq;
+          bestIdx = i;
+        }
+      }
+
+      const float minCorner = std::max(2.0f, diag * 0.10f);
+      if (bestIdx > 0 && bestIdx < (count - 1) && bestPerpSq >= (minCorner * minCorner)) {
+        const uint8_t t1 = quantizeDirection(input[bestIdx].x - start.x, input[bestIdx].y - start.y);
+        const uint8_t t2 = quantizeDirection(end.x - input[bestIdx].x, end.y - input[bestIdx].y);
+        outCount = 0;
+        if (outCount < maxTokens) {
+          tokens[outCount++] = t1;
+        }
+        if (outCount < maxTokens && t2 != tokens[outCount - 1]) {
+          tokens[outCount++] = t2;
+        }
+      }
+    }
   }
 
   if (outCount == 0) {
