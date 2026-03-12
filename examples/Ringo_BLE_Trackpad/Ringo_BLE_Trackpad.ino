@@ -10,7 +10,7 @@
 #include "Arduino_DriveBus_Library.h"
 #include "Arduino_GFX_Library.h"
 #include "pin_config.h"
-#include "GraffitiRecognizer.h"
+#include "GraffitiEngine.h"
 
 #include <BLE2902.h>
 #include <BLEDevice.h>
@@ -161,8 +161,8 @@ uint32_t g_touchDownStartMs = 0;
 int16_t g_touchDownX = -1;
 int16_t g_touchDownY = -1;
 bool g_swipeHandledThisTouch = false;
-GraffitiRecognizer g_graffitiRecognizer;
-GraffitiRecognizer::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
+GraffitiEngine g_graffitiEngine;
+GraffitiEngine::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
 uint16_t g_graffitiStrokeCount = 0;
 uint16_t g_graffitiLastStrokePoints = 0;
 uint32_t g_graffitiTouchStartMs = 0;
@@ -974,11 +974,11 @@ void processSerialCommand(const char *line) {
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
     Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
     Serial.printf("[cmd] recognizer=%s trie=%lu point=%lu lastTok=%u seq=%s\n",
-                  g_graffitiRecognizer.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY",
-                  static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
-                  static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
-                  g_graffitiRecognizer.lastTokenCount(),
-                  g_graffitiRecognizer.lastTokenSequence());
+                  g_graffitiEngine.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY",
+                  static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
+                  static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
+                  g_graffitiEngine.lastTokenCount(),
+                  g_graffitiEngine.lastTokenSequence());
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
@@ -1007,28 +1007,28 @@ void processSerialCommand(const char *line) {
   }
   if (cmd == "recog" || cmd == "recog?" || cmd == "recog mode") {
     setCommandAck(String("recog=") +
-                  (g_graffitiRecognizer.legacyPointFallbackEnabled() ? "hybrid" : "trie"));
+                  (g_graffitiEngine.legacyPointFallbackEnabled() ? "hybrid" : "trie"));
     Serial.printf("[cmd] trie=%lu point=%lu lastTok=%u seq=%s\n",
-                  static_cast<unsigned long>(g_graffitiRecognizer.trieAcceptCount()),
-                  static_cast<unsigned long>(g_graffitiRecognizer.pointAcceptCount()),
-                  g_graffitiRecognizer.lastTokenCount(),
-                  g_graffitiRecognizer.lastTokenSequence());
+                  static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
+                  static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
+                  g_graffitiEngine.lastTokenCount(),
+                  g_graffitiEngine.lastTokenSequence());
     return;
   }
   if (cmd == "recog trie") {
-    g_graffitiRecognizer.setLegacyPointFallbackEnabled(false);
-    g_graffitiRecognizer.resetStats();
+    g_graffitiEngine.setLegacyPointFallbackEnabled(false);
+    g_graffitiEngine.resetStats();
     setCommandAck("ok recog=trie");
     return;
   }
   if (cmd == "recog hybrid") {
-    g_graffitiRecognizer.setLegacyPointFallbackEnabled(true);
-    g_graffitiRecognizer.resetStats();
+    g_graffitiEngine.setLegacyPointFallbackEnabled(true);
+    g_graffitiEngine.resetStats();
     setCommandAck("ok recog=hybrid");
     return;
   }
   if (cmd == "recog reset") {
-    g_graffitiRecognizer.resetStats();
+    g_graffitiEngine.resetStats();
     setCommandAck("ok recog reset");
     return;
   }
@@ -1095,11 +1095,11 @@ String graffitiSymbolLabel(char symbol) {
   return String(buf);
 }
 
-const char *graffitiEngineLabel(GraffitiRecognizer::Engine engine) {
+const char *graffitiEngineLabel(GraffitiEngine::Backend engine) {
   switch (engine) {
-    case GraffitiRecognizer::Engine::Trie:
+    case GraffitiEngine::Backend::Trie:
       return "TRIE";
-    case GraffitiRecognizer::Engine::LegacyPoint:
+    case GraffitiEngine::Backend::LegacyPoint:
       return "POINT";
     default:
       return "NONE";
@@ -1157,8 +1157,8 @@ void finalizeGraffitiStroke() {
     return;
   }
 
-  GraffitiRecognizer::Result result;
-  if (!g_graffitiRecognizer.recognize(g_graffitiStroke, g_graffitiStrokeCount, result)) {
+  GraffitiEngine::Result result;
+  if (!g_graffitiEngine.classify(g_graffitiStroke, g_graffitiStrokeCount, result)) {
     g_graffitiStatus = "ERROR";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
@@ -1167,22 +1167,22 @@ void finalizeGraffitiStroke() {
     return;
   }
 
-  g_graffitiLastScore = result.score;
-  g_graffitiLastMatch = String(result.name) + ":" + graffitiSymbolLabel(result.symbol);
-  if (result.score >= GraffitiRecognizer::kAcceptScore) {
+  g_graffitiLastScore = result.confidence;
+  g_graffitiLastMatch = String(result.label) + ":" + graffitiSymbolLabel(result.symbol);
+  if (result.accepted) {
     g_graffitiStatus = "ACCEPT";
     const bool keySent = applyGraffitiSymbol(result.symbol);
     Serial.printf("[graffiti] ACCEPT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s kbd=%s\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.distance,
-                  graffitiEngineLabel(result.engine), result.tokenCount,
-                  g_graffitiRecognizer.lastTokenSequence(),
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
+                  graffitiEngineLabel(result.backend), result.tokenCount,
+                  g_graffitiEngine.lastTokenSequence(),
                   keySent ? "ok" : "skip");
   } else {
     g_graffitiStatus = "REJECT";
     Serial.printf("[graffiti] REJECT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.distance,
-                  graffitiEngineLabel(result.engine), result.tokenCount,
-                  g_graffitiRecognizer.lastTokenSequence());
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
+                  graffitiEngineLabel(result.backend), result.tokenCount,
+                  g_graffitiEngine.lastTokenSequence());
   }
 
   resetGraffitiTapSwitchState();
@@ -2040,7 +2040,7 @@ void setup() {
   }
   initBleMouse();
   Serial.printf("[graffiti] recognizer mode=%s\n",
-                g_graffitiRecognizer.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY");
+                g_graffitiEngine.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY");
 
   renderStatus(true);
 }
