@@ -241,3 +241,12 @@
     - `--session-dir <dir>` to reuse or target a specific dataset folder
     - `--fresh` to avoid reusing a populated session directory
   - explicit `--output` is still supported for legacy/manual flows, but it disables the automatic per-attempt directory behavior
+
+## 2026-03-14 prototype backend deployment
+- Replaced `GraffitiEngine` trie wrapper with a conditioned nearest-prototype backend using exported model data in `examples/Ringo_BLE_Trackpad/GraffitiPrototypeModel.generated.cpp`.
+- `tools/train_graffiti_model.py` now auto-selects the latest attempt dataset and exports a firmware artifact for prototype deployments.
+- Added `glyph letters|punct|numeric` device commands to control the classifier condition explicitly.
+- Lowered `kGraffitiStrokeMinPoints` from `4` to `2` so `.` can be entered as a short stroke.
+- Verified compile with `arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc --libraries libraries --output-dir debug/flash_backups/build_model_proto1 examples/Ringo_BLE_Trackpad`.
+- Verified flash with `tools/flash_ringo_esptool.sh /dev/cu.usbmodem101 /Users/noah/projects/T-QT-C6/debug/flash_backups/build_model_proto1`.
+- Post-flash CDC sanity check returned `recognizer=PROTOTYPE cond=letters`.

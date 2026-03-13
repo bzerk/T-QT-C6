@@ -3,14 +3,19 @@
 
 #include <Arduino.h>
 
-#include "GraffitiRecognizer.h"
+#include "GraffitiPrototypeModel.h"
 
 class GraffitiEngine {
  public:
   enum class Backend : uint8_t {
     None = 0,
-    Trie = 1,
-    LegacyPoint = 2,
+    Prototype = 1,
+  };
+
+  enum class Condition : uint8_t {
+    Letters = 0,
+    Punct = 1,
+    Numeric = 2,
   };
 
   struct Point {
@@ -29,9 +34,12 @@ class GraffitiEngine {
     uint8_t tokenCount;
   };
 
-  static constexpr float kAcceptConfidence = GraffitiRecognizer::kAcceptScore;
+  static constexpr float kAcceptConfidence = 0.020f;
 
   bool classify(const Point *points, uint16_t count, Result &out);
+  void setCondition(Condition condition);
+  Condition condition() const;
+  const char *conditionName() const;
   void setLegacyPointFallbackEnabled(bool enabled);
   bool legacyPointFallbackEnabled() const;
   uint32_t trieAcceptCount() const;
@@ -41,7 +49,18 @@ class GraffitiEngine {
   void resetStats();
 
  private:
-  GraffitiRecognizer recognizer_;
+  static constexpr uint16_t kResampledPointCount = GraffitiPrototypeModelData::kStrokeSampleCount;
+  static constexpr uint16_t kStrokeFeatureDim = GraffitiPrototypeModelData::kStrokeFeatureDim;
+  static constexpr uint16_t kInputFeatureDim = GraffitiPrototypeModelData::kInputFeatureDim;
+
+  static bool resampleStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount);
+  static void normalizeResampledPoints(Point *points, uint16_t count);
+  bool buildFeatureVector(const Point *points, uint16_t count, float *out) const;
+
+  Condition condition_ = Condition::Letters;
+  uint32_t acceptCount_ = 0;
+  uint32_t rejectCount_ = 0;
+  char lastSequence_[16] = "MODEL";
 };
 
 #endif  // RINGO_GRAFFITI_ENGINE_H

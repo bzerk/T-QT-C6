@@ -2,70 +2,252 @@
 
 namespace {
 constexpr uint16_t kMaxEnginePoints = 192;
+constexpr float kMinPointDistanceSq = 1.0f;
 
-GraffitiEngine::Backend mapBackend(GraffitiRecognizer::Engine engine) {
-  switch (engine) {
-    case GraffitiRecognizer::Engine::Trie:
-      return GraffitiEngine::Backend::Trie;
-    case GraffitiRecognizer::Engine::LegacyPoint:
-      return GraffitiEngine::Backend::LegacyPoint;
-    default:
-      return GraffitiEngine::Backend::None;
+float squaredDistance(const float *lhs, const float *rhs, uint16_t count) {
+  float total = 0.0f;
+  for (uint16_t i = 0; i < count; ++i) {
+    const float delta = lhs[i] - rhs[i];
+    total += delta * delta;
   }
+  return total;
 }
 }  // namespace
 
-bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) {
-  if (points == nullptr || count == 0 || count > kMaxEnginePoints) {
+void GraffitiEngine::setCondition(Condition condition) {
+  condition_ = condition;
+}
+
+GraffitiEngine::Condition GraffitiEngine::condition() const {
+  return condition_;
+}
+
+const char *GraffitiEngine::conditionName() const {
+  switch (condition_) {
+    case Condition::Letters:
+      return "letters";
+    case Condition::Punct:
+      return "punct";
+    case Condition::Numeric:
+      return "numeric";
+    default:
+      return "letters";
+  }
+}
+
+bool GraffitiEngine::resampleStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount) {
+  if (input == nullptr || out == nullptr || count == 0 || outCount == 0) {
     return false;
   }
 
-  GraffitiRecognizer::Point scratch[kMaxEnginePoints];
+  Point deduped[kMaxEnginePoints];
+  uint16_t dedupCount = 0;
+  for (uint16_t i = 0; i < count && dedupCount < kMaxEnginePoints; ++i) {
+    if (dedupCount == 0) {
+      deduped[dedupCount++] = input[i];
+      continue;
+    }
+    const float dx = input[i].x - deduped[dedupCount - 1].x;
+    const float dy = input[i].y - deduped[dedupCount - 1].y;
+    if (((dx * dx) + (dy * dy)) <= kMinPointDistanceSq) {
+      continue;
+    }
+    deduped[dedupCount++] = input[i];
+  }
+
+  if (dedupCount == 0) {
+    return false;
+  }
+  if (dedupCount == 1) {
+    for (uint16_t i = 0; i < outCount; ++i) {
+      out[i] = deduped[0];
+    }
+    return true;
+  }
+
+  float cumulative[kMaxEnginePoints];
+  cumulative[0] = 0.0f;
+  for (uint16_t i = 1; i < dedupCount; ++i) {
+    const float dx = deduped[i].x - deduped[i - 1].x;
+    const float dy = deduped[i].y - deduped[i - 1].y;
+    cumulative[i] = cumulative[i - 1] + sqrtf((dx * dx) + (dy * dy));
+  }
+
+  const float totalLength = cumulative[dedupCount - 1];
+  if (totalLength <= 1e-6f) {
+    for (uint16_t i = 0; i < outCount; ++i) {
+      out[i] = deduped[0];
+    }
+    return true;
+  }
+
+  uint16_t segIndex = 1;
+  const uint16_t denom = (outCount > 1) ? static_cast<uint16_t>(outCount - 1) : 1;
+  for (uint16_t i = 0; i < outCount; ++i) {
+    const float targetDistance = totalLength * static_cast<float>(i) / static_cast<float>(denom);
+    while (segIndex < (dedupCount - 1) && cumulative[segIndex] < targetDistance) {
+      ++segIndex;
+    }
+
+    const float prevDist = cumulative[segIndex - 1];
+    const float nextDist = cumulative[segIndex];
+    const Point &prevPoint = deduped[segIndex - 1];
+    const Point &nextPoint = deduped[segIndex];
+    if (nextDist <= prevDist) {
+      out[i] = prevPoint;
+      continue;
+    }
+
+    const float mix = (targetDistance - prevDist) / (nextDist - prevDist);
+    out[i].x = prevPoint.x + ((nextPoint.x - prevPoint.x) * mix);
+    out[i].y = prevPoint.y + ((nextPoint.y - prevPoint.y) * mix);
+  }
+  return true;
+}
+
+void GraffitiEngine::normalizeResampledPoints(Point *points, uint16_t count) {
+  if (points == nullptr || count == 0) {
+    return;
+  }
+
+  float minX = points[0].x;
+  float maxX = points[0].x;
+  float minY = points[0].y;
+  float maxY = points[0].y;
+  for (uint16_t i = 1; i < count; ++i) {
+    minX = min(minX, points[i].x);
+    maxX = max(maxX, points[i].x);
+    minY = min(minY, points[i].y);
+    maxY = max(maxY, points[i].y);
+  }
+
+  const float centerX = (minX + maxX) * 0.5f;
+  const float centerY = (minY + maxY) * 0.5f;
+  const float scale = max(max(maxX - minX, maxY - minY), 1.0f);
   for (uint16_t i = 0; i < count; ++i) {
-    scratch[i].x = points[i].x;
-    scratch[i].y = points[i].y;
+    points[i].x = ((points[i].x - centerX) * 2.0f) / scale;
+    points[i].y = ((points[i].y - centerY) * 2.0f) / scale;
   }
+}
 
-  GraffitiRecognizer::Result raw = {};
-  if (!recognizer_.recognize(scratch, count, raw)) {
+bool GraffitiEngine::buildFeatureVector(const Point *points, uint16_t count, float *out) const {
+  if (points == nullptr || out == nullptr || count == 0 || count > kMaxEnginePoints) {
     return false;
   }
 
-  out.symbol = raw.symbol;
-  out.label = raw.name;
-  out.confidence = raw.score;
-  out.rawScore = raw.score;
-  out.rawDistance = raw.distance;
-  out.backend = mapBackend(raw.engine);
-  out.accepted = (raw.score >= kAcceptConfidence);
-  out.tokenCount = raw.tokenCount;
+  Point normalized[kResampledPointCount];
+  if (!resampleStroke(points, count, normalized, kResampledPointCount)) {
+    return false;
+  }
+  normalizeResampledPoints(normalized, kResampledPointCount);
+
+  uint16_t featureIndex = 0;
+  float prevX = 0.0f;
+  float prevY = 0.0f;
+  for (uint16_t i = 0; i < kResampledPointCount; ++i) {
+    const float curX = normalized[i].x;
+    const float curY = normalized[i].y;
+    const float dx = (i == 0) ? 0.0f : (curX - prevX);
+    const float dy = (i == 0) ? 0.0f : (curY - prevY);
+
+    const float rawValues[4] = {curX, curY, dx, dy};
+    for (uint8_t j = 0; j < 4; ++j) {
+      const float mean = GraffitiPrototypeModelData::kMeans[featureIndex];
+      const float stdv = GraffitiPrototypeModelData::kStds[featureIndex];
+      out[featureIndex] = (rawValues[j] - mean) / stdv;
+      ++featureIndex;
+    }
+    prevX = curX;
+    prevY = curY;
+  }
+
+  for (uint8_t i = 0; i < GraffitiPrototypeModelData::kConditionCount; ++i) {
+    out[featureIndex++] = (static_cast<uint8_t>(condition_) == i)
+                              ? GraffitiPrototypeModelData::kConditionWeight
+                              : 0.0f;
+  }
+  return true;
+}
+
+bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) {
+  if (points == nullptr || count == 0 || count > kMaxEnginePoints ||
+      GraffitiPrototypeModelData::kPrototypeCount == 0) {
+    return false;
+  }
+
+  float featureVector[kInputFeatureDim];
+  if (!buildFeatureVector(points, count, featureVector)) {
+    return false;
+  }
+
+  const GraffitiPrototypeModelData::PrototypeEntry *bestPrototype = nullptr;
+  float bestDistance = INFINITY;
+  float secondDistance = INFINITY;
+  for (uint16_t i = 0; i < GraffitiPrototypeModelData::kPrototypeCount; ++i) {
+    const auto &prototype = GraffitiPrototypeModelData::kPrototypes[i];
+    if (prototype.conditionIndex != static_cast<uint8_t>(condition_)) {
+      continue;
+    }
+    const float distance = squaredDistance(featureVector, prototype.vector, kInputFeatureDim);
+    if (distance < bestDistance) {
+      secondDistance = bestDistance;
+      bestDistance = distance;
+      bestPrototype = &prototype;
+    } else if (distance < secondDistance) {
+      secondDistance = distance;
+    }
+  }
+
+  if (bestPrototype == nullptr || !isfinite(bestDistance)) {
+    return false;
+  }
+
+  const float confidence = 1.0f / (1.0f + bestDistance);
+  const float margin = isfinite(secondDistance) ? (secondDistance - bestDistance) : bestDistance;
+  out.symbol = bestPrototype->symbol;
+  out.label = bestPrototype->label;
+  out.confidence = confidence;
+  out.rawScore = margin;
+  out.rawDistance = bestDistance;
+  out.backend = Backend::Prototype;
+  out.accepted = (confidence >= kAcceptConfidence);
+  out.tokenCount = 0;
+
+  strlcpy(lastSequence_, conditionName(), sizeof(lastSequence_));
+  if (out.accepted) {
+    ++acceptCount_;
+  } else {
+    ++rejectCount_;
+  }
   return true;
 }
 
 void GraffitiEngine::setLegacyPointFallbackEnabled(bool enabled) {
-  recognizer_.setLegacyPointFallbackEnabled(enabled);
+  (void)enabled;
 }
 
 bool GraffitiEngine::legacyPointFallbackEnabled() const {
-  return recognizer_.legacyPointFallbackEnabled();
+  return false;
 }
 
 uint32_t GraffitiEngine::trieAcceptCount() const {
-  return recognizer_.trieAcceptCount();
+  return acceptCount_;
 }
 
 uint32_t GraffitiEngine::pointAcceptCount() const {
-  return recognizer_.pointAcceptCount();
+  return rejectCount_;
 }
 
 uint8_t GraffitiEngine::lastTokenCount() const {
-  return recognizer_.lastTokenCount();
+  return 0;
 }
 
 const char *GraffitiEngine::lastTokenSequence() const {
-  return recognizer_.lastTokenSequence();
+  return lastSequence_;
 }
 
 void GraffitiEngine::resetStats() {
-  recognizer_.resetStats();
+  acceptCount_ = 0;
+  rejectCount_ = 0;
+  strlcpy(lastSequence_, "MODEL", sizeof(lastSequence_));
 }

@@ -32,7 +32,7 @@ constexpr int32_t kI2cBusHz = 100000;
 constexpr uint32_t kGraffitiImuPollMs = 35;
 constexpr uint32_t kImuDebugIntervalMs = 500;
 constexpr uint16_t kGraffitiStrokeMaxPoints = 180;
-constexpr uint16_t kGraffitiStrokeMinPoints = 4;
+constexpr uint16_t kGraffitiStrokeMinPoints = 2;
 constexpr uint32_t kGraffitiStrokeMaxDurationMs = 2200;
 constexpr int32_t kGraffitiMinPointDistanceSq = 1;
 constexpr uint32_t kGraffitiTapMaxDurationMs = 520;
@@ -1053,7 +1053,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|trace?|trace off|trace once|trace cont|cap?|cap off|cap <label>|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog reset|glyph?|glyph letters|glyph punct|glyph numeric|trace?|trace off|trace once|trace cont|cap?|cap off|cap <label>|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -1091,8 +1091,8 @@ void processSerialCommand(const char *line) {
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
     Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
-    Serial.printf("[cmd] recognizer=%s trie=%lu point=%lu lastTok=%u seq=%s\n",
-                  g_graffitiEngine.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY",
+    Serial.printf("[cmd] recognizer=%s cond=%s accept=%lu reject=%lu lastTok=%u seq=%s\n",
+                  "PROTOTYPE", g_graffitiEngine.conditionName(),
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
@@ -1128,30 +1128,37 @@ void processSerialCommand(const char *line) {
     return;
   }
   if (cmd == "recog" || cmd == "recog?" || cmd == "recog mode") {
-    setCommandAck(String("recog=") +
-                  (g_graffitiEngine.legacyPointFallbackEnabled() ? "hybrid" : "trie"));
-    Serial.printf("[cmd] trie=%lu point=%lu lastTok=%u seq=%s\n",
+    setCommandAck(String("recog=prototype cond=") + g_graffitiEngine.conditionName());
+    Serial.printf("[cmd] accept=%lu reject=%lu lastTok=%u seq=%s cond=%s\n",
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
-                  g_graffitiEngine.lastTokenSequence());
-    return;
-  }
-  if (cmd == "recog trie") {
-    g_graffitiEngine.setLegacyPointFallbackEnabled(false);
-    g_graffitiEngine.resetStats();
-    setCommandAck("ok recog=trie");
-    return;
-  }
-  if (cmd == "recog hybrid") {
-    g_graffitiEngine.setLegacyPointFallbackEnabled(true);
-    g_graffitiEngine.resetStats();
-    setCommandAck("ok recog=hybrid");
+                  g_graffitiEngine.lastTokenSequence(),
+                  g_graffitiEngine.conditionName());
     return;
   }
   if (cmd == "recog reset") {
     g_graffitiEngine.resetStats();
-    setCommandAck("ok recog reset");
+    setCommandAck("ok recog=prototype");
+    return;
+  }
+  if (cmd == "glyph" || cmd == "glyph?" || cmd == "cond" || cmd == "cond?") {
+    setCommandAck(String("ok glyph=") + g_graffitiEngine.conditionName());
+    return;
+  }
+  if (cmd == "glyph letters" || cmd == "cond letters" || cmd == "letters") {
+    g_graffitiEngine.setCondition(GraffitiEngine::Condition::Letters);
+    setCommandAck("ok glyph=letters");
+    return;
+  }
+  if (cmd == "glyph punct" || cmd == "cond punct" || cmd == "punct") {
+    g_graffitiEngine.setCondition(GraffitiEngine::Condition::Punct);
+    setCommandAck("ok glyph=punct");
+    return;
+  }
+  if (cmd == "glyph numeric" || cmd == "cond numeric" || cmd == "numeric") {
+    g_graffitiEngine.setCondition(GraffitiEngine::Condition::Numeric);
+    setCommandAck("ok glyph=numeric");
     return;
   }
   if (cmd == "trace" || cmd == "trace?" || cmd == "stream" || cmd == "stream?") {
@@ -1269,10 +1276,8 @@ String graffitiSymbolLabel(char symbol) {
 
 const char *graffitiEngineLabel(GraffitiEngine::Backend engine) {
   switch (engine) {
-    case GraffitiEngine::Backend::Trie:
-      return "TRIE";
-    case GraffitiEngine::Backend::LegacyPoint:
-      return "POINT";
+    case GraffitiEngine::Backend::Prototype:
+      return "PROTO";
     default:
       return "NONE";
   }
@@ -2260,8 +2265,8 @@ void setup() {
     Serial.printf("[cfg] using default scroll_gain=%.2f\n", g_scrollGain);
   }
   initBleMouse();
-  Serial.printf("[graffiti] recognizer mode=%s\n",
-                g_graffitiEngine.legacyPointFallbackEnabled() ? "HYBRID" : "TRIE_ONLY");
+  Serial.printf("[graffiti] recognizer mode=PROTOTYPE cond=%s\n",
+                g_graffitiEngine.conditionName());
 
   renderStatus(true);
 }

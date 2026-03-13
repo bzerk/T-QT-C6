@@ -187,9 +187,25 @@ def load_dataset(path: Path) -> list[SampleRecord]:
 
 
 def auto_dataset_path(root: Path) -> Optional[Path]:
+    capture_root = root / "debug/graffiti_capture"
+    attempt_candidates: list[Path] = []
+    if capture_root.exists():
+        for directory in capture_root.iterdir():
+            if not directory.is_dir():
+                continue
+            if not (directory.name.startswith("attempt_") or directory.name.startswith("run")):
+                continue
+            for filename in ("tinyml_dataset.jsonl", "tinyml_dataset.csv"):
+                candidate = directory / filename
+                if candidate.exists():
+                    attempt_candidates.append(candidate)
+    attempt_candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    if attempt_candidates:
+        return attempt_candidates[0]
+
     candidates = [
-        root / "debug/graffiti_capture/tinyml_dataset.jsonl",
-        root / "debug/graffiti_capture/tinyml_dataset.csv",
+        capture_root / "tinyml_dataset.jsonl",
+        capture_root / "tinyml_dataset.csv",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -661,6 +677,79 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def cpp_char_literal(symbol: str) -> str:
+    if len(symbol) != 1:
+        raise TrainingError(f"expected single-character symbol, got {symbol!r}")
+    if symbol == "\\":
+        return "'\\\\'"
+    if symbol == "'":
+        return "'\\''"
+    if symbol == "\n":
+        return "'\\n'"
+    if symbol == "\r":
+        return "'\\r'"
+    if symbol == "\b":
+        return "'\\b'"
+    return f"'{symbol}'"
+
+
+def export_prototype_cpp(model: dict, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cpp_path = output_dir / "GraffitiPrototypeModel.generated.cpp"
+    labels = model["labels"]
+    prototypes = model["prototypes"]
+    feature_dim = STROKE_FEATURE_DIM + len(CONDITIONS)
+
+    lines: list[str] = []
+    lines.append('#include "GraffitiPrototypeModel.h"')
+    lines.append("")
+    lines.append("namespace GraffitiPrototypeModelData {")
+    lines.append("")
+    lines.append(f"const float kConditionWeight = {float(model['condition_weight']):.8f}f;")
+    lines.append("")
+
+    def emit_float_array(name: str, values: list[float]) -> None:
+        lines.append(f"const float {name}[{len(values)}] = {{")
+        for start in range(0, len(values), 8):
+            chunk = ", ".join(f"{float(value):.8f}f" for value in values[start:start + 8])
+            suffix = "," if (start + 8) < len(values) else ""
+            lines.append(f"  {chunk}{suffix}")
+        lines.append("};")
+        lines.append("")
+
+    emit_float_array("kMeans", model["means"])
+    emit_float_array("kStds", model["stds"])
+
+    prototype_total = sum(len(prototypes.get(label, [])) for label in labels)
+    lines.append(f"const uint16_t kPrototypeCount = {prototype_total};")
+    lines.append("")
+
+    vector_counter = 0
+    for label in labels:
+        for centroid in prototypes.get(label, []):
+            emit_float_array(f"kPrototypeVector{vector_counter:03d}", centroid)
+            vector_counter += 1
+
+    lines.append("const PrototypeEntry kPrototypes[] = {")
+    vector_counter = 0
+    for label in labels:
+        condition_index = CONDITIONS.index(LABEL_TO_CONDITION[label])
+        symbol = "\b" if label == "BKSP" else (" " if label == "SPACE" else label)
+        symbol_literal = cpp_char_literal(symbol)
+        for _centroid in prototypes.get(label, []):
+            lines.append(
+                f'  {{{symbol_literal}, {condition_index}, "{label}", kPrototypeVector{vector_counter:03d}}},'
+            )
+            vector_counter += 1
+    lines.append("};")
+    lines.append("")
+    lines.append(f"static_assert(kInputFeatureDim == {feature_dim}, \"feature dimension mismatch\");")
+    lines.append("")
+    lines.append("}  // namespace GraffitiPrototypeModelData")
+    lines.append("")
+    cpp_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def select_backend(name: str) -> str:
     if name != "auto":
         return name
@@ -718,6 +807,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=120,
         help="TensorFlow only: max training epochs",
+    )
+    parser.add_argument(
+        "--firmware-export-dir",
+        type=Path,
+        default=Path("examples/Ringo_BLE_Trackpad"),
+        help="Prototype backend only: export GraffitiPrototypeModel.generated.cpp into this directory",
     )
     return parser.parse_args()
 
@@ -824,6 +919,7 @@ def main() -> int:
     }
     if backend_name == "prototype_v1":
         write_json(output_dir / "model.json", model)
+        export_prototype_cpp(model, args.firmware_export_dir)
     write_json(output_dir / "metadata.json", metadata)
     write_json(output_dir / "label_map.json", {"labels": labels})
     write_json(output_dir / "condition_map.json", {"conditions": CONDITIONS, "labels_by_condition": LABELS_BY_CONDITION})
