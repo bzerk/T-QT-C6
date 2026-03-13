@@ -52,6 +52,7 @@ TOKEN_ALIASES = {
     "lparen": "(",
     "rparen": ")",
 }
+CAPTURE_ROOT = Path("debug/graffiti_capture")
 
 
 @dataclass
@@ -266,6 +267,64 @@ def clone_script_state(state: ScriptedCaptureState) -> ScriptedCaptureState:
         active=state.active,
         total_saved=state.total_saved,
     )
+
+
+def timestamp_slug() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def next_available_attempt_dir(root: Path, prefix: str = "attempt") -> Path:
+    base = root / f"{prefix}_{timestamp_slug()}"
+    if not base.exists():
+        return base
+    suffix = 1
+    while True:
+        candidate = root / f"{prefix}_{timestamp_slug()}_{suffix:02d}"
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def resolve_capture_output(
+    output_arg: Optional[Path],
+    session_dir_arg: Optional[Path],
+    fresh: bool,
+    output_explicit: bool,
+) -> tuple[Path, Path]:
+    if output_explicit and output_arg is not None:
+        output_path = output_arg
+        session_dir = output_path.parent
+        if fresh and output_path.exists():
+            raise SystemExit(
+                "--fresh cannot reuse an explicit --output path. Use --session-dir or omit --output."
+            )
+        return session_dir, output_path
+
+    root = CAPTURE_ROOT
+    if session_dir_arg is not None:
+        session_dir = session_dir_arg
+        if fresh and session_dir.exists() and any(session_dir.iterdir()):
+            session_dir = next_available_attempt_dir(session_dir.parent, prefix=session_dir.name)
+    else:
+        session_dir = next_available_attempt_dir(root)
+    return session_dir, session_dir / "samples.jsonl"
+
+
+def write_session_metadata(session_dir: Path, port: str, baud: int, output_path: Path, fresh: bool) -> None:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "pid": os.getpid(),
+        "port": port,
+        "baud": baud,
+        "session_dir": str(session_dir.resolve()),
+        "output_path": str(output_path.resolve()),
+        "tinyml_jsonl_path": str((session_dir / "tinyml_dataset.jsonl").resolve()),
+        "tinyml_csv_path": str((session_dir / "tinyml_dataset.csv").resolve()),
+        "gui_log_path": str((session_dir / "gui.log").resolve()),
+        "fresh_requested": bool(fresh),
+    }
+    (session_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
 def resample_stroke(points: list[list[int]], sample_count: int = 32) -> list[tuple[float, float]]:
@@ -1463,8 +1522,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("debug/graffiti_capture/samples.jsonl"),
-        help="JSONL output path",
+        default=None,
+        help="Explicit JSONL output path. If omitted, a per-attempt session directory is created automatically.",
+    )
+    parser.add_argument(
+        "--session-dir",
+        type=Path,
+        default=None,
+        help="Session directory to hold samples.jsonl, tinyml_dataset.*, gui.log, and metadata.json",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start a fresh attempt directory instead of reusing an existing session directory",
     )
     return parser.parse_args()
 
@@ -1474,12 +1544,16 @@ def main() -> int:
     if not args.port:
         print("No serial port found.")
         return 1
-    instance_lock = SingleInstanceLock(Path("debug/graffiti_capture/gui.lock"))
+    instance_lock = SingleInstanceLock(CAPTURE_ROOT / "gui.lock")
     if not instance_lock.acquire():
-        print("Another graffiti_capture_gui.py instance is already running. See debug/graffiti_capture/gui.log")
+        print(f"Another graffiti_capture_gui.py instance is already running. Check {CAPTURE_ROOT / 'gui.lock'}.")
         return 2
+    output_explicit = "--output" in sys.argv
+    session_dir, output_path = resolve_capture_output(args.output, args.session_dir, args.fresh, output_explicit)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    write_session_metadata(session_dir, args.port, args.baud, output_path, args.fresh)
     root = tk.Tk()
-    app = GraffitiCaptureGui(root, args.port, args.baud, args.output, instance_lock=instance_lock)
+    app = GraffitiCaptureGui(root, args.port, args.baud, output_path, instance_lock=instance_lock)
     app._render_live()
     app._render_last()
     app._render_meta()

@@ -234,3 +234,10 @@
   - treats mid-session reboot as a recovery event instead of random log noise
   - clears the in-flight unsaved stroke, waits for boot, reconfigures `mode graffiti` + `trace cont`, and resumes the active scripted target/rep
   - avoids duplicate startup/recovery configure timers by using a single deferred-config path
+- Collector fresh-start workflow updated:
+  - default launch now creates a per-attempt session directory under `debug/graffiti_capture/attempt_YYYYMMDD_HHMMSS/`
+  - session directory contains `samples.jsonl`, `tinyml_dataset.jsonl`, `tinyml_dataset.csv`, `gui.log`, and `metadata.json`
+  - new CLI flags:
+    - `--session-dir <dir>` to reuse or target a specific dataset folder
+    - `--fresh` to avoid reusing a populated session directory
+  - explicit `--output` is still supported for legacy/manual flows, but it disables the automatic per-attempt directory behavior

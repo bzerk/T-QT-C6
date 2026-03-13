@@ -8,6 +8,11 @@ The trainer consumes either of these capture exports:
 - `debug/graffiti_capture/tinyml_dataset.jsonl`
 - `debug/graffiti_capture/tinyml_dataset.csv`
 
+With the newer collector flow, each run should normally live in its own attempt directory, for example:
+
+- `debug/graffiti_capture/attempt_20260314_120000/tinyml_dataset.jsonl`
+- `debug/graffiti_capture/attempt_20260314_120000/tinyml_dataset.csv`
+
 Expected label space:
 
 - lowercase letters: `a-z`
@@ -33,7 +38,7 @@ Explicit dataset and output directory:
 
 ```bash
 python3 tools/train_graffiti_model.py \
-  --input debug/graffiti_capture/tinyml_dataset.jsonl \
+  --input debug/graffiti_capture/attempt_20260314_120000/tinyml_dataset.jsonl \
   --output-dir debug/graffiti_model/latest
 ```
 
