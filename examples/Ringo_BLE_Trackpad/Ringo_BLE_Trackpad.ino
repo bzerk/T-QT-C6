@@ -24,6 +24,9 @@ constexpr uint8_t kMouseReportId = 0x01;
 constexpr uint8_t kKeyboardReportId = 0x02;
 
 constexpr uint32_t kDisplayRefreshMs = 140;
+constexpr uint8_t kDisplayBacklightPwm = 160;
+constexpr uint8_t kDisplayBacklightOffPwm = 255;
+constexpr uint32_t kRejectFlashMs = 70;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kGraffitiTouchPollMs = 12;
@@ -47,7 +50,16 @@ constexpr uint32_t kGraffitiExitSwipeMaxDurationMs = 900;
 constexpr int16_t kGraffitiExitSwipeMinDyPx = 24;
 constexpr int16_t kGraffitiExitSwipeMaxDxPx = 40;
 constexpr uint32_t kGraffitiIdleTouchPollMs = 40;
-constexpr uint32_t kGraffitiReleaseHoldMs = 180;
+constexpr uint32_t kGraffitiReleaseHoldMs = 36;
+constexpr uint8_t kGraffitiReleaseSamples = 2;
+constexpr uint8_t kGraffitiCompletedQueueDepth = 4;
+constexpr uint32_t kGraffitiCommandLongPressMs = 520;
+constexpr int16_t kGraffitiCommandSwipeMinDyPx = 28;
+constexpr int16_t kGraffitiCommandSwipeMaxDxPx = 40;
+constexpr uint32_t kArrowRepeatInitialMs = 280;
+constexpr uint32_t kArrowRepeatMs = 85;
+constexpr int16_t kArrowEdgeMarginPx = 26;
+constexpr int16_t kArrowCenterHalfSizePx = 18;
 constexpr int16_t kCstIdleX = 60;
 constexpr int16_t kCstIdleY = 150;
 constexpr uint8_t kGraffitiCaptureLabelMaxLen = 16;
@@ -103,6 +115,18 @@ constexpr uint32_t kAutoBiasSaveIntervalMs = 180000;
 enum class InputMode : uint8_t {
   Mouse,
   Graffiti,
+};
+
+enum class GraffitiGlyphMode : uint8_t {
+  Alpha,
+  Numeric,
+  Arrow,
+};
+
+enum class GraffitiShiftMode : uint8_t {
+  Off,
+  OneShot,
+  CapsLock,
 };
 
 enum class GraffitiTraceMode : uint8_t {
@@ -169,6 +193,18 @@ int16_t g_touchDownX = -1;
 int16_t g_touchDownY = -1;
 bool g_swipeHandledThisTouch = false;
 GraffitiEngine g_graffitiEngine;
+struct QueuedGraffitiStroke {
+  GraffitiEngine::Point points[kGraffitiStrokeMaxPoints];
+  uint16_t timeMs[kGraffitiStrokeMaxPoints];
+  uint16_t count = 0;
+  uint16_t pressMs = 0;
+  int16_t deltaX = 0;
+  int16_t deltaY = 0;
+  uint32_t traceStrokeId = 0;
+  bool captureArmed = false;
+  char captureLabel[kGraffitiCaptureLabelMaxLen] = {0};
+};
+
 GraffitiEngine::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
 uint16_t g_graffitiStrokeTimeMs[kGraffitiStrokeMaxPoints] = {0};
 uint16_t g_graffitiStrokeCount = 0;
@@ -178,6 +214,10 @@ String g_graffitiText = "";
 String g_graffitiStatus = "IDLE";
 String g_graffitiLastMatch = "NONE";
 float g_graffitiLastScore = 0.0f;
+uint32_t g_graffitiLastInferUs = 0;
+uint32_t g_graffitiMaxInferUs = 0;
+uint64_t g_graffitiInferAccumUs = 0;
+uint32_t g_graffitiInferCount = 0;
 char g_serialCmdBuffer[kSerialCmdMaxLen] = {0};
 uint8_t g_serialCmdLen = 0;
 uint32_t g_graffitiTapArmedMs = 0;
@@ -197,6 +237,20 @@ uint32_t g_captureStrokeId = 0;
 GraffitiTraceMode g_graffitiTraceMode = GraffitiTraceMode::Off;
 uint32_t g_graffitiTraceStrokeId = 0;
 uint32_t g_activeGraffitiTraceStrokeId = 0;
+QueuedGraffitiStroke g_completedGraffitiQueue[kGraffitiCompletedQueueDepth];
+uint8_t g_completedGraffitiHead = 0;
+uint8_t g_completedGraffitiTail = 0;
+uint8_t g_completedGraffitiCount = 0;
+uint32_t g_completedGraffitiDropped = 0;
+bool g_keyboardReleasePending = false;
+uint32_t g_keyboardReleaseDueMs = 0;
+bool g_displayEnabled = false;
+uint32_t g_rejectFlashUntilMs = 0;
+GraffitiGlyphMode g_graffitiGlyphMode = GraffitiGlyphMode::Alpha;
+GraffitiShiftMode g_graffitiShiftMode = GraffitiShiftMode::Off;
+bool g_graffitiOneShotPunct = false;
+uint8_t g_arrowHeldUsage = 0;
+uint32_t g_arrowRepeatDueMs = 0;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -214,6 +268,10 @@ void renderStatus(bool force = false);
 void updateImuOrientationOnly();
 struct ImuSample;
 void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel);
+void serviceKeyboardRelease();
+void serviceArrowRepeat();
+void tapKeyboardKeyUsage(uint8_t usage);
+void updateDisplayBacklight();
 bool loadGyroBiasFromNvs();
 bool saveGyroBiasToNvs();
 bool loadUiConfigFromNvs();
@@ -224,6 +282,10 @@ bool recalibrateGyroBias(bool persistBias);
 void setCommandAck(const String &ack);
 String graffitiSymbolLabel(char symbol);
 const char *graffitiEngineLabel(GraffitiEngine::Backend engine);
+bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t deltaY, uint16_t pointCount);
+bool applyGraffitiSymbol(char symbol);
+const char *graffitiGlyphModeName(GraffitiGlyphMode mode);
+const char *graffitiShiftModeName(GraffitiShiftMode mode);
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -376,9 +438,46 @@ void sendKeyboardReport(uint8_t modifier, uint8_t keyUsage) {
 }
 
 void tapKeyboardUsage(uint8_t modifier, uint8_t keyUsage) {
+  if (g_keyboardReleasePending) {
+    sendKeyboardReport(0, 0);
+    g_keyboardReleasePending = false;
+  }
   sendKeyboardReport(modifier, keyUsage);
-  delay(8);
+  g_keyboardReleasePending = true;
+  g_keyboardReleaseDueMs = millis() + 8;
+}
+
+void serviceKeyboardRelease() {
+  if (!g_keyboardReleasePending) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_keyboardReleaseDueMs) < 0) {
+    return;
+  }
   sendKeyboardReport(0, 0);
+  g_keyboardReleasePending = false;
+}
+
+void serviceArrowRepeat() {
+  if (g_arrowHeldUsage == 0 || !g_touchDown) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_arrowRepeatDueMs) < 0) {
+    return;
+  }
+  tapKeyboardKeyUsage(g_arrowHeldUsage);
+  g_arrowRepeatDueMs = now + kArrowRepeatMs;
+}
+
+void updateDisplayBacklight() {
+  const uint32_t now = millis();
+  const bool rejectFlashActive = static_cast<int32_t>(now - g_rejectFlashUntilMs) < 0;
+  const bool overlayActive =
+      (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct || rejectFlashActive;
+  const uint8_t pwm = (g_displayEnabled || overlayActive) ? kDisplayBacklightPwm : kDisplayBacklightOffPwm;
+  ledcWrite(LCD_BL, pwm);
 }
 
 bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
@@ -414,6 +513,42 @@ bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
     case '\r':
       usage = 0x28;
       return true;
+    case '.':
+      usage = 0x37;
+      return true;
+    case ',':
+      usage = 0x36;
+      return true;
+    case '-':
+      usage = 0x2D;
+      return true;
+    case '_':
+      usage = 0x2D;
+      modifier = 0x02;
+      return true;
+    case '?':
+      usage = 0x38;
+      modifier = 0x02;
+      return true;
+    case '\'':
+      usage = 0x34;
+      return true;
+    case '#':
+      usage = 0x20;
+      modifier = 0x02;
+      return true;
+    case '*':
+      usage = 0x25;
+      modifier = 0x02;
+      return true;
+    case '(':
+      usage = 0x26;
+      modifier = 0x02;
+      return true;
+    case ')':
+      usage = 0x27;
+      modifier = 0x02;
+      return true;
     default:
       return false;
   }
@@ -427,6 +562,72 @@ bool sendKeyboardSymbol(char symbol) {
   }
   tapKeyboardUsage(modifier, usage);
   return true;
+}
+
+void tapKeyboardKeyUsage(uint8_t usage) {
+  tapKeyboardUsage(0, usage);
+}
+
+bool sendEscKey() {
+  tapKeyboardKeyUsage(0x29);
+  return true;
+}
+
+void setGraffitiGlyphMode(GraffitiGlyphMode mode) {
+  g_graffitiGlyphMode = mode;
+  if (mode == GraffitiGlyphMode::Arrow) {
+    g_graffitiOneShotPunct = false;
+  }
+}
+
+uint8_t arrowUsageForPoint(int16_t x, int16_t y) {
+  if (x < kArrowEdgeMarginPx) {
+    return 0x50;
+  }
+  if (x > (LCD_WIDTH - kArrowEdgeMarginPx)) {
+    return 0x4F;
+  }
+  if (y < kArrowEdgeMarginPx) {
+    return 0x52;
+  }
+  if (y > (LCD_HEIGHT - kArrowEdgeMarginPx)) {
+    return 0x51;
+  }
+  if (abs(x - (LCD_WIDTH / 2)) <= kArrowCenterHalfSizePx &&
+      abs(y - (LCD_HEIGHT / 2)) <= kArrowCenterHalfSizePx) {
+    return 0x28;
+  }
+  return 0;
+}
+
+GraffitiEngine::Condition activeGraffitiCondition() {
+  if (g_graffitiOneShotPunct) {
+    return GraffitiEngine::Condition::Punct;
+  }
+  if (g_graffitiGlyphMode == GraffitiGlyphMode::Numeric) {
+    return GraffitiEngine::Condition::Numeric;
+  }
+  return GraffitiEngine::Condition::Letters;
+}
+
+char applyGraffitiShift(char symbol) {
+  if (symbol < 'a' || symbol > 'z') {
+    return symbol;
+  }
+  if (g_graffitiShiftMode == GraffitiShiftMode::CapsLock ||
+      g_graffitiShiftMode == GraffitiShiftMode::OneShot) {
+    return static_cast<char>('A' + (symbol - 'a'));
+  }
+  return symbol;
+}
+
+void consumeGraffitiOneShotModes(char symbol) {
+  if (g_graffitiOneShotPunct) {
+    g_graffitiOneShotPunct = false;
+  }
+  if (g_graffitiShiftMode == GraffitiShiftMode::OneShot && symbol >= 'a' && symbol <= 'z') {
+    g_graffitiShiftMode = GraffitiShiftMode::Off;
+  }
 }
 
 void queueSetupShift(uint8_t attempts, uint32_t delayMs) {
@@ -643,6 +844,12 @@ void resetStationaryBiasEstimator() {
   g_stationaryGyroSumZ = 0.0f;
 }
 
+void resetCompletedGraffitiQueue() {
+  g_completedGraffitiHead = 0;
+  g_completedGraffitiTail = 0;
+  g_completedGraffitiCount = 0;
+}
+
 void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps) {
   const float accelMagG = sqrtf((sample.ax_mg * sample.ax_mg) +
                                 (sample.ay_mg * sample.ay_mg) +
@@ -715,6 +922,28 @@ const char *graffitiTraceModeName(GraffitiTraceMode mode) {
       return "continuous";
     default:
       return "stop";
+  }
+}
+
+const char *graffitiGlyphModeName(GraffitiGlyphMode mode) {
+  switch (mode) {
+    case GraffitiGlyphMode::Numeric:
+      return "NUM";
+    case GraffitiGlyphMode::Arrow:
+      return "ARR";
+    default:
+      return "ALPHA";
+  }
+}
+
+const char *graffitiShiftModeName(GraffitiShiftMode mode) {
+  switch (mode) {
+    case GraffitiShiftMode::OneShot:
+      return "1X";
+    case GraffitiShiftMode::CapsLock:
+      return "CAPS";
+    default:
+      return "OFF";
   }
 }
 
@@ -819,6 +1048,45 @@ void emitGraffitiTracePoint(int16_t x, int16_t y, uint16_t t_ms) {
                 static_cast<int>(x), static_cast<int>(y), static_cast<unsigned>(t_ms));
 }
 
+void populateQueuedGraffitiStroke(QueuedGraffitiStroke &out) {
+  out.count = g_graffitiStrokeCount;
+  out.pressMs = g_graffitiLastPressMs;
+  out.deltaX = g_graffitiLastDeltaX;
+  out.deltaY = g_graffitiLastDeltaY;
+  out.traceStrokeId = g_activeGraffitiTraceStrokeId;
+  out.captureArmed = g_captureNextStrokeArmed;
+  if (out.captureArmed) {
+    strlcpy(out.captureLabel, g_captureNextLabel, sizeof(out.captureLabel));
+  } else {
+    out.captureLabel[0] = '\0';
+  }
+  for (uint16_t i = 0; i < out.count; ++i) {
+    out.points[i] = g_graffitiStroke[i];
+    out.timeMs[i] = g_graffitiStrokeTimeMs[i];
+  }
+}
+
+bool enqueueGraffitiStroke(const QueuedGraffitiStroke &stroke) {
+  if (g_completedGraffitiCount >= kGraffitiCompletedQueueDepth) {
+    ++g_completedGraffitiDropped;
+    return false;
+  }
+  g_completedGraffitiQueue[g_completedGraffitiTail] = stroke;
+  g_completedGraffitiTail = (g_completedGraffitiTail + 1) % kGraffitiCompletedQueueDepth;
+  ++g_completedGraffitiCount;
+  return true;
+}
+
+bool dequeueGraffitiStroke(QueuedGraffitiStroke &out) {
+  if (g_completedGraffitiCount == 0) {
+    return false;
+  }
+  out = g_completedGraffitiQueue[g_completedGraffitiHead];
+  g_completedGraffitiHead = (g_completedGraffitiHead + 1) % kGraffitiCompletedQueueDepth;
+  --g_completedGraffitiCount;
+  return true;
+}
+
 void endGraffitiTraceStroke(const char *status, const GraffitiEngine::Result *result) {
   if (!graffitiTraceActive() || g_activeGraffitiTraceStrokeId == 0) {
     return;
@@ -847,6 +1115,40 @@ void endGraffitiTraceStroke(const char *status, const GraffitiEngine::Result *re
                 static_cast<unsigned>(g_graffitiLastPressMs), g_graffitiLastDeltaX, g_graffitiLastDeltaY);
 
   g_activeGraffitiTraceStrokeId = 0;
+  if (g_graffitiTraceMode == GraffitiTraceMode::Once) {
+    g_graffitiTraceMode = GraffitiTraceMode::Off;
+    setCommandAck("trace=stop");
+  }
+}
+
+void endQueuedGraffitiTraceStroke(const QueuedGraffitiStroke &stroke, const char *status,
+                                  const GraffitiEngine::Result *result) {
+  if (!graffitiTraceActive() || stroke.traceStrokeId == 0) {
+    return;
+  }
+
+  String predicted = "-";
+  float confidence = 0.0f;
+  float distance = 0.0f;
+  bool accepted = false;
+  uint8_t tokenCount = 0;
+  const char *backend = "NONE";
+  const char *seq = g_graffitiEngine.lastTokenSequence();
+  if (result != nullptr) {
+    predicted = graffitiSymbolLabel(result->symbol);
+    confidence = result->confidence;
+    distance = result->rawDistance;
+    accepted = result->accepted;
+    tokenCount = result->tokenCount;
+    backend = graffitiEngineLabel(result->backend);
+  }
+
+  Serial.printf("[trace] end id=%lu status=%s pred=%s accepted=%u score=%.2f dist=%.2f backend=%s tok=%u seq=%s points=%u dur=%u dx=%d dy=%d\n",
+                static_cast<unsigned long>(stroke.traceStrokeId), status, predicted.c_str(),
+                accepted ? 1U : 0U, confidence, distance, backend, static_cast<unsigned>(tokenCount),
+                seq, static_cast<unsigned>(stroke.count), static_cast<unsigned>(stroke.pressMs),
+                stroke.deltaX, stroke.deltaY);
+
   if (g_graffitiTraceMode == GraffitiTraceMode::Once) {
     g_graffitiTraceMode = GraffitiTraceMode::Off;
     setCommandAck("trace=stop");
@@ -998,6 +1300,9 @@ void resetInputTransientState() {
   g_scrollResidual = 0.0f;
   g_lastDeltaX = 0;
   g_lastDeltaY = 0;
+  g_arrowHeldUsage = 0;
+  resetCompletedGraffitiQueue();
+  g_keyboardReleasePending = false;
   resetGraffitiTapSwitchState();
   resetGraffitiStrokeState();
 }
@@ -1010,6 +1315,9 @@ void setInputMode(InputMode mode) {
   resetInputTransientState();
   if (mode == InputMode::Graffiti) {
     g_graffitiTapOnlyActive = false;
+    setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
+    g_graffitiShiftMode = GraffitiShiftMode::Off;
+    g_graffitiOneShotPunct = false;
     g_graffitiStatus = "READY";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
@@ -1017,6 +1325,9 @@ void setInputMode(InputMode mode) {
     resetGraffitiTapSwitchState();
   } else {
     g_graffitiTapOnlyActive = false;
+    setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
+    g_graffitiShiftMode = GraffitiShiftMode::Off;
+    g_graffitiOneShotPunct = false;
     g_graffitiStatus = "IDLE";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
@@ -1091,16 +1402,28 @@ void processSerialCommand(const char *line) {
                   g_graffitiTapOnlyActive ? 1U : 0U, graffitiInvertProjection());
     Serial.printf("[cmd] bias x=%.2f y=%.2f z=%.2f\n", g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
     Serial.printf("[cmd] scroll_gain=%.2f residual=%.2f\n", g_scrollGain, g_scrollResidual);
-    Serial.printf("[cmd] recognizer=%s cond=%s accept=%lu reject=%lu lastTok=%u seq=%s\n",
+    const unsigned long inferAvgUs =
+        (g_graffitiInferCount == 0) ? 0UL
+                                    : static_cast<unsigned long>(g_graffitiInferAccumUs / g_graffitiInferCount);
+    Serial.printf("[cmd] recognizer=%s cond=%s glyph=%s shift=%s punct1x=%u accept=%lu reject=%lu lastTok=%u seq=%s infer_us=%lu avg_us=%lu max_us=%lu\n",
                   "PROTOTYPE", g_graffitiEngine.conditionName(),
+                  graffitiGlyphModeName(g_graffitiGlyphMode), graffitiShiftModeName(g_graffitiShiftMode),
+                  g_graffitiOneShotPunct ? 1U : 0U,
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
-                  g_graffitiEngine.lastTokenSequence());
+                  g_graffitiEngine.lastTokenSequence(),
+                  static_cast<unsigned long>(g_graffitiLastInferUs),
+                  inferAvgUs,
+                  static_cast<unsigned long>(g_graffitiMaxInferUs));
     Serial.printf("[cmd] trace=%s active_id=%lu\n", graffitiTraceModeName(g_graffitiTraceMode),
                   static_cast<unsigned long>(g_activeGraffitiTraceStrokeId));
     Serial.printf("[cmd] capture=%s label=%s\n", g_captureNextStrokeArmed ? "armed" : "off",
                   g_captureNextStrokeArmed ? g_captureNextLabel : "-");
+    Serial.printf("[cmd] queue depth=%u dropped=%lu keyrel=%u\n",
+                  static_cast<unsigned>(g_completedGraffitiCount),
+                  static_cast<unsigned long>(g_completedGraffitiDropped),
+                  g_keyboardReleasePending ? 1U : 0U);
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
@@ -1129,16 +1452,30 @@ void processSerialCommand(const char *line) {
   }
   if (cmd == "recog" || cmd == "recog?" || cmd == "recog mode") {
     setCommandAck(String("recog=prototype cond=") + g_graffitiEngine.conditionName());
-    Serial.printf("[cmd] accept=%lu reject=%lu lastTok=%u seq=%s cond=%s\n",
+    const unsigned long inferAvgUs =
+        (g_graffitiInferCount == 0) ? 0UL
+                                    : static_cast<unsigned long>(g_graffitiInferAccumUs / g_graffitiInferCount);
+    Serial.printf("[cmd] accept=%lu reject=%lu lastTok=%u seq=%s cond=%s glyph=%s shift=%s punct1x=%u infer_us=%lu avg_us=%lu max_us=%lu q=%u drop=%lu\n",
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
                   g_graffitiEngine.lastTokenSequence(),
-                  g_graffitiEngine.conditionName());
+                  g_graffitiEngine.conditionName(),
+                  graffitiGlyphModeName(g_graffitiGlyphMode), graffitiShiftModeName(g_graffitiShiftMode),
+                  g_graffitiOneShotPunct ? 1U : 0U,
+                  static_cast<unsigned long>(g_graffitiLastInferUs),
+                  inferAvgUs,
+                  static_cast<unsigned long>(g_graffitiMaxInferUs),
+                  static_cast<unsigned>(g_completedGraffitiCount),
+                  static_cast<unsigned long>(g_completedGraffitiDropped));
     return;
   }
   if (cmd == "recog reset") {
     g_graffitiEngine.resetStats();
+    g_graffitiLastInferUs = 0;
+    g_graffitiMaxInferUs = 0;
+    g_graffitiInferAccumUs = 0;
+    g_graffitiInferCount = 0;
     setCommandAck("ok recog=prototype");
     return;
   }
@@ -1270,6 +1607,9 @@ String graffitiSymbolLabel(char symbol) {
   if (symbol == '\n' || symbol == '\r') {
     return "RET";
   }
+  if (symbol == 0x1B) {
+    return "ESC";
+  }
   char buf[2] = {symbol, '\0'};
   return String(buf);
 }
@@ -1335,6 +1675,43 @@ void emitGraffitiCapture(const char *status, const GraffitiEngine::Result *resul
   disarmGraffitiCapture();
 }
 
+void emitQueuedGraffitiCapture(const QueuedGraffitiStroke &stroke, const char *status,
+                               const GraffitiEngine::Result *result) {
+  if (!stroke.captureArmed) {
+    return;
+  }
+
+  ++g_captureStrokeId;
+  String predicted = "-";
+  float confidence = 0.0f;
+  float distance = 0.0f;
+  bool accepted = false;
+  uint8_t tokenCount = 0;
+  const char *backend = "NONE";
+  const char *seq = g_graffitiEngine.lastTokenSequence();
+  if (result != nullptr) {
+    predicted = graffitiSymbolLabel(result->symbol);
+    confidence = result->confidence;
+    distance = result->rawDistance;
+    accepted = result->accepted;
+    tokenCount = result->tokenCount;
+    backend = graffitiEngineLabel(result->backend);
+  }
+
+  Serial.printf("[cap] id=%lu label=%s status=%s pred=%s accepted=%u score=%.2f dist=%.2f backend=%s tok=%u seq=%s points=%u dur=%u dx=%d dy=%d pts=",
+                static_cast<unsigned long>(g_captureStrokeId), stroke.captureLabel, status,
+                predicted.c_str(), accepted ? 1U : 0U, confidence, distance, backend,
+                static_cast<unsigned>(tokenCount), seq, static_cast<unsigned>(stroke.count),
+                static_cast<unsigned>(stroke.pressMs), stroke.deltaX, stroke.deltaY);
+  for (uint16_t i = 0; i < stroke.count; ++i) {
+    Serial.printf("%s[%d,%d,%u]", (i == 0) ? "" : ",",
+                  static_cast<int>(stroke.points[i].x),
+                  static_cast<int>(stroke.points[i].y),
+                  static_cast<unsigned>(stroke.timeMs[i]));
+  }
+  Serial.println();
+}
+
 void graffitiAddPoint(int16_t x, int16_t y, uint32_t now) {
   if (g_graffitiStrokeCount > 0) {
     const float dx = static_cast<float>(x) - g_graffitiStroke[g_graffitiStrokeCount - 1].x;
@@ -1377,40 +1754,91 @@ void finalizeGraffitiStroke() {
     return;
   }
 
-  GraffitiEngine::Result result;
-  if (!g_graffitiEngine.classify(g_graffitiStroke, g_graffitiStrokeCount, result)) {
-    g_graffitiStatus = "ERROR";
-    g_graffitiLastMatch = "NONE";
-    g_graffitiLastScore = 0.0f;
-    endGraffitiTraceStroke("ERROR", nullptr);
-    emitGraffitiCapture("ERROR", nullptr);
-    resetGraffitiTapSwitchState();
-    resetGraffitiStrokeState();
+  QueuedGraffitiStroke completed;
+  populateQueuedGraffitiStroke(completed);
+  disarmGraffitiCapture();
+  resetGraffitiTapSwitchState();
+  resetGraffitiStrokeState();
+  if (enqueueGraffitiStroke(completed)) {
+    g_graffitiStatus = "QUEUED";
     return;
   }
 
+  g_graffitiStatus = "QFULL";
+  g_graffitiLastMatch = "NONE";
+  g_graffitiLastScore = 0.0f;
+  endQueuedGraffitiTraceStroke(completed, "QFULL", nullptr);
+  emitQueuedGraffitiCapture(completed, "QFULL", nullptr);
+}
+
+void serviceCompletedGraffitiQueue() {
+  QueuedGraffitiStroke stroke;
+  if (!dequeueGraffitiStroke(stroke)) {
+    return;
+  }
+
+  g_graffitiEngine.setCondition(activeGraffitiCondition());
+  GraffitiEngine::Result result;
+  const uint32_t inferStartUs = micros();
+  if (!g_graffitiEngine.classify(stroke.points, stroke.count, result)) {
+    g_graffitiLastInferUs = micros() - inferStartUs;
+    g_graffitiMaxInferUs = max(g_graffitiMaxInferUs, g_graffitiLastInferUs);
+    g_graffitiInferAccumUs += g_graffitiLastInferUs;
+    g_graffitiInferCount++;
+    g_graffitiStatus = "ERROR";
+    g_graffitiLastMatch = "NONE";
+    g_graffitiLastScore = 0.0f;
+    endQueuedGraffitiTraceStroke(stroke, "ERROR", nullptr);
+    emitQueuedGraffitiCapture(stroke, "ERROR", nullptr);
+    return;
+  }
+
+  g_graffitiLastInferUs = micros() - inferStartUs;
+  g_graffitiMaxInferUs = max(g_graffitiMaxInferUs, g_graffitiLastInferUs);
+  g_graffitiInferAccumUs += g_graffitiLastInferUs;
+  g_graffitiInferCount++;
+  char resolvedSymbol = result.symbol;
+  if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow && resolvedSymbol == 'o') {
+    resolvedSymbol = 0x1B;
+  } else {
+    resolvedSymbol = applyGraffitiShift(resolvedSymbol);
+  }
   g_graffitiLastScore = result.confidence;
-  g_graffitiLastMatch = String(result.label) + ":" + graffitiSymbolLabel(result.symbol);
+  g_graffitiLastMatch = String(result.label) + ":" + graffitiSymbolLabel(resolvedSymbol);
+
   if (result.accepted) {
     g_graffitiStatus = "ACCEPT";
-    const bool keySent = applyGraffitiSymbol(result.symbol);
-    Serial.printf("[graffiti] ACCEPT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s kbd=%s\n",
+    bool keySent = false;
+    if (resolvedSymbol == 0x1B) {
+      keySent = sendEscKey();
+    } else {
+      keySent = applyGraffitiSymbol(resolvedSymbol);
+    }
+    consumeGraffitiOneShotModes(resolvedSymbol);
+    Serial.printf("[graffiti] ACCEPT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u kbd=%s mode=%s shift=%s\n",
                   g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
                   graffitiEngineLabel(result.backend), result.tokenCount,
                   g_graffitiEngine.lastTokenSequence(),
-                  keySent ? "ok" : "skip");
+                  static_cast<unsigned long>(g_graffitiLastInferUs),
+                  static_cast<unsigned>(g_completedGraffitiCount),
+                  keySent ? "ok" : "skip",
+                  graffitiGlyphModeName(g_graffitiGlyphMode),
+                  graffitiShiftModeName(g_graffitiShiftMode));
   } else {
     g_graffitiStatus = "REJECT";
-    Serial.printf("[graffiti] REJECT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s\n",
+    g_rejectFlashUntilMs = millis() + kRejectFlashMs;
+    Serial.printf("[graffiti] REJECT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u mode=%s shift=%s\n",
                   g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
                   graffitiEngineLabel(result.backend), result.tokenCount,
-                  g_graffitiEngine.lastTokenSequence());
+                  g_graffitiEngine.lastTokenSequence(),
+                  static_cast<unsigned long>(g_graffitiLastInferUs),
+                  static_cast<unsigned>(g_completedGraffitiCount),
+                  graffitiGlyphModeName(g_graffitiGlyphMode),
+                  graffitiShiftModeName(g_graffitiShiftMode));
   }
 
-  endGraffitiTraceStroke(g_graffitiStatus.c_str(), &result);
-  emitGraffitiCapture(g_graffitiStatus.c_str(), &result);
-  resetGraffitiTapSwitchState();
-  resetGraffitiStrokeState();
+  endQueuedGraffitiTraceStroke(stroke, g_graffitiStatus.c_str(), &result);
+  emitQueuedGraffitiCapture(stroke, g_graffitiStatus.c_str(), &result);
 }
 
 bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t deltaY, uint16_t pointCount) {
@@ -1448,6 +1876,18 @@ void sampleGraffitiExitTapOnly() {
     const bool tapLike = (pressDuration <= kTouchTapMaxDurationMs &&
                           absDx <= kTouchTapMoveThresholdPx &&
                           absDy <= kTouchTapMoveThresholdPx);
+    const bool swipeUp = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                          deltaY <= -kGraffitiCommandSwipeMinDyPx &&
+                          absDx <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeDown = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                            deltaY >= kGraffitiCommandSwipeMinDyPx &&
+                            absDx <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeRight = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                             deltaX >= kGraffitiCommandSwipeMinDyPx &&
+                             absDy <= kGraffitiCommandSwipeMaxDxPx);
+    const bool longPress = (pressDuration >= kGraffitiCommandLongPressMs &&
+                            absDx <= kTouchTapMoveThresholdPx &&
+                            absDy <= kTouchTapMoveThresholdPx);
 
     g_graffitiLastDeltaX = deltaX;
     g_graffitiLastDeltaY = deltaY;
@@ -1455,6 +1895,60 @@ void sampleGraffitiExitTapOnly() {
     g_touchDown = false;
     g_touchActive = false;
     resetGraffitiStrokeState();
+
+    if (swipeUp) {
+      if (g_graffitiGlyphMode == GraffitiGlyphMode::Numeric) {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
+        g_graffitiStatus = "MODE ALPHA";
+      } else {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Numeric);
+        g_graffitiStatus = "MODE NUM";
+      }
+      resetGraffitiTapSwitchState();
+      return;
+    }
+
+    if (swipeDown) {
+      if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
+        g_graffitiStatus = "ARROW OFF";
+      } else {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Arrow);
+        g_graffitiShiftMode = GraffitiShiftMode::Off;
+        g_graffitiOneShotPunct = false;
+        g_graffitiStatus = "ARROW ON";
+      }
+      resetGraffitiTapSwitchState();
+      return;
+    }
+
+    if (swipeRight) {
+      g_displayEnabled = !g_displayEnabled;
+      updateDisplayBacklight();
+      if (g_displayEnabled) {
+        g_graffitiStatus = "DISP ON";
+        renderStatus(true);
+      } else {
+        gfx->fillScreen(BLACK);
+        g_graffitiStatus = "DISP OFF";
+      }
+      resetGraffitiTapSwitchState();
+      return;
+    }
+
+    if (longPress) {
+      if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
+        g_graffitiStatus = "ARROW OFF";
+      } else {
+        setGraffitiGlyphMode(GraffitiGlyphMode::Arrow);
+        g_graffitiShiftMode = GraffitiShiftMode::Off;
+        g_graffitiOneShotPunct = false;
+        g_graffitiStatus = "ARROW ON";
+      }
+      resetGraffitiTapSwitchState();
+      return;
+    }
 
     if (!tapLike) {
       g_graffitiStatus = "CMD TAP";
@@ -1469,17 +1963,19 @@ void sampleGraffitiExitTapOnly() {
       if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
         const bool toGraffiti = (g_inputMode == InputMode::Mouse);
         g_graffitiStatus = toGraffiti ? "MODE->GRAF" : "MODE->MOUSE";
+        g_graffitiOneShotPunct = false;
         resetGraffitiTapSwitchState();
         toggleInputMode();
         return;
       }
     }
 
+    g_graffitiOneShotPunct = true;
     g_graffitiTapArmed = true;
     g_graffitiTapArmedMs = now;
     g_graffitiTapAnchorX = g_touchDownX;
     g_graffitiTapAnchorY = g_touchDownY;
-    g_graffitiStatus = "CMD TAP1";
+    g_graffitiStatus = "PUNCT 1X";
     return;
   }
 
@@ -1517,6 +2013,9 @@ void sampleGraffitiTouchState() {
   }
 
   const uint32_t now = millis();
+  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  const bool fingerPresent = finger > 0;
   const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
   const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
@@ -1539,9 +2038,52 @@ void sampleGraffitiTouchState() {
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
   const bool coordTouch = coordValid && !coordIdle;
-  const bool touchPresentRaw = coordTouch;
+  const bool touchPresentRaw = fingerPresent && coordTouch;
 
-  if (coordTouch) {
+  if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) {
+    if (touchPresentRaw) {
+      g_touchActive = true;
+      g_touchX = x;
+      g_touchY = y;
+      g_lastTouchEventMs = now;
+      const uint8_t usage = arrowUsageForPoint(x, y);
+      if (!g_touchDown) {
+        g_touchDown = true;
+        g_touchDownStartMs = now;
+        g_touchDownX = x;
+        g_touchDownY = y;
+        if (usage != 0) {
+          tapKeyboardKeyUsage(usage);
+          g_arrowHeldUsage = usage;
+          g_arrowRepeatDueMs = now + kArrowRepeatInitialMs;
+          g_graffitiStatus = (usage == 0x28) ? "AR ENTER" : "AR TAP";
+          return;
+        }
+        resetGraffitiStrokeState();
+        g_graffitiTouchStartMs = now;
+        g_graffitiStatus = "AR DRAW";
+        g_graffitiLastCoordMs = now;
+        beginGraffitiTraceStroke();
+      }
+
+      if (g_arrowHeldUsage != 0) {
+        return;
+      }
+      g_graffitiLastCoordMs = now;
+      graffitiAddPoint(x, y, now);
+      return;
+    }
+
+    if (g_arrowHeldUsage != 0) {
+      g_touchDown = false;
+      g_touchActive = false;
+      g_arrowHeldUsage = 0;
+      g_graffitiStatus = "AR READY";
+      return;
+    }
+  }
+
+  if (fingerPresent && coordTouch) {
     g_touchActive = true;
     g_touchX = x;
     g_touchY = y;
@@ -1583,7 +2125,16 @@ void sampleGraffitiTouchState() {
     return;
   }
 
-  if (g_graffitiLastCoordMs != 0 &&
+  if (!fingerPresent) {
+    if (g_graffitiNoFingerSamples < 255) {
+      ++g_graffitiNoFingerSamples;
+    }
+  } else {
+    g_graffitiNoFingerSamples = 0;
+  }
+
+  if (g_graffitiNoFingerSamples < kGraffitiReleaseSamples &&
+      g_graffitiLastCoordMs != 0 &&
       (now - g_graffitiLastCoordMs) <= kGraffitiReleaseHoldMs) {
     return;
   }
@@ -1779,13 +2330,14 @@ void initBoardPowerAndDisplay() {
 
   pinMode(LCD_BL, OUTPUT);
   ledcAttach(LCD_BL, 2000, 8);
-  ledcWrite(LCD_BL, 0);
+  ledcWrite(LCD_BL, kDisplayBacklightOffPwm);
 
   gfx->begin();
   gfx->fillScreen(BLACK);
   gfx->setTextColor(WHITE);
   gfx->setTextSize(1);
   gfx->setTextWrap(false);
+  updateDisplayBacklight();
 }
 
 void initTouch() {
@@ -1946,10 +2498,34 @@ void initBleMouse() {
 
 void renderStatus(bool force) {
   const uint32_t now = millis();
+  const bool rejectFlashActive = static_cast<int32_t>(now - g_rejectFlashUntilMs) < 0;
+  const bool overlayActive =
+      (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct || rejectFlashActive;
+  if (!g_displayEnabled && !overlayActive) {
+    return;
+  }
   if (!force && (now - g_lastDisplayRefreshMs) < kDisplayRefreshMs) {
     return;
   }
   g_lastDisplayRefreshMs = now;
+
+  if (rejectFlashActive) {
+    gfx->fillScreen(WHITE);
+    g_statusFrameDrawn = false;
+    return;
+  }
+
+  if (!g_displayEnabled) {
+    gfx->fillScreen(BLACK);
+    if (g_graffitiShiftMode != GraffitiShiftMode::Off) {
+      gfx->fillRect(0, 0, LCD_WIDTH, LCD_HEIGHT / 8, WHITE);
+    }
+    if (g_graffitiOneShotPunct) {
+      gfx->fillCircle(LCD_WIDTH - 8 - 7, 8 + 7, 7, YELLOW);
+    }
+    g_statusFrameDrawn = false;
+    return;
+  }
 
   if (force || !g_statusFrameDrawn) {
     gfx->fillScreen(BLACK);
@@ -1984,11 +2560,11 @@ void renderStatus(bool force) {
     snprintf(buf, sizeof(buf), "dX:%4d dY:%4d t:%3u", g_graffitiLastDeltaX, g_graffitiLastDeltaY,
              g_graffitiLastPressMs);
     drawStatusLine(5, 80, String(buf), WHITE, force);
-    snprintf(buf, sizeof(buf), "Gra:%s n%u l%u", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
-             g_graffitiLastStrokePoints);
+    snprintf(buf, sizeof(buf), "Gra:%s n%u q%u", g_graffitiStatus.c_str(), g_graffitiStrokeCount,
+             static_cast<unsigned>(g_completedGraffitiCount));
     drawStatusLine(6, 94, String(buf), WHITE, force);
-    snprintf(buf, sizeof(buf), "I:%c %.2f %s", g_graffitiTapOnlyActive ? 'Y' : 'N',
-             graffitiInvertProjection(), g_graffitiReadFault ? "T-ERR" : "T-OK");
+    snprintf(buf, sizeof(buf), "%s %s P:%c", graffitiGlyphModeName(g_graffitiGlyphMode),
+             graffitiShiftModeName(g_graffitiShiftMode), g_graffitiOneShotPunct ? 'Y' : 'N');
     drawStatusLine(7, 104, String(buf), GREEN, force);
     drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
   }
@@ -2275,6 +2851,8 @@ void loop() {
   const uint32_t now = millis();
   bool touchEdge = false;
   pollSerialCommands();
+  serviceKeyboardRelease();
+  serviceArrowRepeat();
   serviceSetupShift();
 
   if (g_touchInterrupt) {
@@ -2333,7 +2911,9 @@ void loop() {
     resetGraffitiTapSwitchState();
     if (!g_touchDown) {
       if (g_graffitiTapOnlyActive) {
-        g_graffitiStatus = "CMD TAP";
+        if (!g_graffitiOneShotPunct) {
+          g_graffitiStatus = "CMD TAP";
+        }
       } else if (g_inputMode == InputMode::Graffiti) {
         g_graffitiStatus = "READY";
       } else {
@@ -2342,6 +2922,8 @@ void loop() {
     }
   }
 
+  serviceCompletedGraffitiQueue();
+  updateDisplayBacklight();
   renderStatus();
   delay(2);
 }

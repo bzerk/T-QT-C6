@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
-PUNCT_LABELS = ["SPACE", "BKSP", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
+PUNCT_LABELS = ["SPACE", "BKSP", "RET", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
 NUMERIC_LABELS = list("0123456789")
 EXPECTED_LABELS = LETTER_LABELS + PUNCT_LABELS + NUMERIC_LABELS
 CONDITIONS = ["letters", "punct", "numeric"]
@@ -734,7 +734,7 @@ def export_prototype_cpp(model: dict, output_dir: Path) -> None:
     vector_counter = 0
     for label in labels:
         condition_index = CONDITIONS.index(LABEL_TO_CONDITION[label])
-        symbol = "\b" if label == "BKSP" else (" " if label == "SPACE" else label)
+        symbol = "\n" if label == "RET" else ("\b" if label == "BKSP" else (" " if label == "SPACE" else label))
         symbol_literal = cpp_char_literal(symbol)
         for _centroid in prototypes.get(label, []):
             lines.append(

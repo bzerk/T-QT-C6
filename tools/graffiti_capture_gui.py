@@ -37,7 +37,7 @@ MODE_SWITCH_RE = re.compile(r"^\[mode\] switched to ([A-Z]+)")
 BOOT_BANNER_RE = re.compile(r"^\[boot\] Ringo BLE trackpad starting$")
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
-PUNCT_LABELS = ["SPACE", "BKSP", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
+PUNCT_LABELS = ["SPACE", "BKSP", "RET", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
 NUMERIC_LABELS = list("0123456789")
 PUNCT_SET = set(PUNCT_LABELS)
 NUMERIC_SET = set(NUMERIC_LABELS)
@@ -47,6 +47,9 @@ TOKEN_ALIASES = {
     "space": "SPACE",
     "bksp": "BKSP",
     "backspace": "BKSP",
+    "ret": "RET",
+    "return": "RET",
+    "enter": "RET",
     "apostrophe": "'",
     "quote": "'",
     "lparen": "(",
