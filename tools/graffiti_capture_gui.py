@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import queue
 import re
 import threading
@@ -48,6 +50,22 @@ class StrokeSample:
     captured_at_ms: int = 0
 
 
+@dataclass
+class ScriptedCaptureState:
+    targets: list[str] = field(default_factory=list)
+    reps_per_target: int = 5
+    target_index: int = 0
+    rep_index: int = 0
+    session_id: str = ""
+    active: bool = False
+    total_saved: int = 0
+
+    def current_target(self) -> str:
+        if not self.active or self.target_index >= len(self.targets):
+            return ""
+        return self.targets[self.target_index]
+
+
 class SerialReader(threading.Thread):
     def __init__(self, port: serial.Serial, out_queue: queue.Queue):
         super().__init__(daemon=True)
@@ -79,6 +97,115 @@ def autodetect_port() -> Optional[str]:
     return sorted(ports)[0] if ports else None
 
 
+def parse_script_targets(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if re.search(r"[,\s]", stripped):
+        parts = [item.strip() for item in re.split(r"[,\s]+", stripped) if item.strip()]
+    else:
+        parts = list(stripped)
+
+    targets: list[str] = []
+    for part in parts:
+        if len(part) == 1 and part.isalpha():
+            targets.append(part.lower())
+        elif len(part) == 1:
+            targets.append(part)
+        else:
+            targets.append(part.upper())
+    return targets
+
+
+def resample_stroke(points: list[list[int]], sample_count: int = 32) -> list[tuple[float, float]]:
+    xy = [(float(x), float(y)) for x, y, _t in points]
+    if not xy:
+        return [(0.0, 0.0)] * sample_count
+
+    deduped: list[tuple[float, float]] = [xy[0]]
+    for point in xy[1:]:
+        if point != deduped[-1]:
+            deduped.append(point)
+
+    if len(deduped) == 1:
+        return [deduped[0]] * sample_count
+
+    cumulative = [0.0]
+    for idx in range(1, len(deduped)):
+        prev_x, prev_y = deduped[idx - 1]
+        cur_x, cur_y = deduped[idx]
+        cumulative.append(cumulative[-1] + math.hypot(cur_x - prev_x, cur_y - prev_y))
+
+    total_length = cumulative[-1]
+    if total_length <= 1e-6:
+        return [deduped[0]] * sample_count
+
+    targets = [total_length * idx / max(1, sample_count - 1) for idx in range(sample_count)]
+    resampled: list[tuple[float, float]] = []
+    seg_idx = 1
+    for target_dist in targets:
+        while seg_idx < len(cumulative) - 1 and cumulative[seg_idx] < target_dist:
+            seg_idx += 1
+        prev_dist = cumulative[seg_idx - 1]
+        next_dist = cumulative[seg_idx]
+        prev_x, prev_y = deduped[seg_idx - 1]
+        next_x, next_y = deduped[seg_idx]
+        if next_dist <= prev_dist:
+            resampled.append((prev_x, prev_y))
+            continue
+        mix = (target_dist - prev_dist) / (next_dist - prev_dist)
+        resampled.append((prev_x + ((next_x - prev_x) * mix), prev_y + ((next_y - prev_y) * mix)))
+    return resampled
+
+
+def normalize_resampled_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not points:
+        return [(0.0, 0.0)] * 32
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    center_x = (min_x + max_x) * 0.5
+    center_y = (min_y + max_y) * 0.5
+    scale = max(max_x - min_x, max_y - min_y, 1.0)
+    return [(((x - center_x) * 2.0) / scale, ((y - center_y) * 2.0) / scale) for x, y in points]
+
+
+def derive_feature_payload(sample: StrokeSample, sample_count: int = 32) -> dict:
+    resampled = resample_stroke(sample.points, sample_count=sample_count)
+    normalized = normalize_resampled_points(resampled)
+    deltas: list[tuple[float, float]] = []
+    prev_x = 0.0
+    prev_y = 0.0
+    for idx, (cur_x, cur_y) in enumerate(normalized):
+        if idx == 0:
+            deltas.append((0.0, 0.0))
+        else:
+            deltas.append((cur_x - prev_x, cur_y - prev_y))
+        prev_x = cur_x
+        prev_y = cur_y
+
+    xs = [point[0] for point in sample.points]
+    ys = [point[1] for point in sample.points]
+    bbox_w = (max(xs) - min(xs)) if xs else 0
+    bbox_h = (max(ys) - min(ys)) if ys else 0
+    path_len = 0.0
+    for idx in range(1, len(sample.points)):
+        prev_x_i, prev_y_i, _prev_t = sample.points[idx - 1]
+        cur_x_i, cur_y_i, _cur_t = sample.points[idx]
+        path_len += math.hypot(float(cur_x_i - prev_x_i), float(cur_y_i - prev_y_i))
+
+    return {
+        "feature_format": "resampled_xy32_plus_dxy32_v1",
+        "sample_count": sample_count,
+        "resampled_xy": [[round(x, 6), round(y, 6)] for x, y in normalized],
+        "resampled_dxy": [[round(dx, 6), round(dy, 6)] for dx, dy in deltas],
+        "path_length_px": round(path_len, 3),
+        "bbox_w_px": bbox_w,
+        "bbox_h_px": bbox_h,
+    }
+
+
 class GraffitiCaptureGui:
     def __init__(self, root: tk.Tk, port_name: str, baud: int, output_path: Path):
         self.root = root
@@ -86,6 +213,8 @@ class GraffitiCaptureGui:
         self.baud = baud
         self.output_path = output_path
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.tinyml_jsonl_path = self.output_path.parent / "tinyml_dataset.jsonl"
+        self.tinyml_csv_path = self.output_path.parent / "tinyml_dataset.csv"
 
         self.serial = serial.Serial(port_name, baudrate=baud, timeout=0.10)
         self.events: queue.Queue = queue.Queue()
@@ -98,17 +227,25 @@ class GraffitiCaptureGui:
         self.status_var = tk.StringVar(value="Connecting...")
         self.output_var = tk.StringVar(value=str(output_path.resolve()))
         self.saved_var = tk.StringVar(value="Saved: 0")
+        self.script_targets_var = tk.StringVar(value="abcdefghijklmnopqrstuvwxyz")
+        self.script_reps_var = tk.IntVar(value=5)
+        self.script_status_var = tk.StringVar(value="Script idle")
+        self.script_target_var = tk.StringVar(value="-")
+        self.script_progress_var = tk.StringVar(value="0 / 0")
+        self.script_detail_var = tk.StringVar(value="Ready")
 
         self.saved_count = 0
         self.current_stroke: Optional[StrokeSample] = None
         self.last_stroke: Optional[StrokeSample] = None
         self.label_entry: Optional[ttk.Entry] = None
+        self.script_state = ScriptedCaptureState()
 
         self._build_ui()
+        self._refresh_script_status()
         self._bind_keys()
         self.reader.start()
-        self.send_command("trace off")
         self.log(f"opened {self.port_name} @ {self.baud}")
+        self.root.after(150, self._start_live_stream)
         self.root.after(30, self._poll_events)
 
     def _build_ui(self) -> None:
@@ -120,8 +257,8 @@ class GraffitiCaptureGui:
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(2, weight=1)
         main.rowconfigure(3, weight=1)
+        main.rowconfigure(4, weight=1)
 
         top = ttk.Frame(main)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
@@ -138,9 +275,9 @@ class GraffitiCaptureGui:
 
         controls = ttk.Frame(main)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        for idx in range(9):
+        for idx in range(12):
             controls.columnconfigure(idx, weight=0)
-        controls.columnconfigure(9, weight=1)
+        controls.columnconfigure(11, weight=1)
 
         ttk.Button(controls, text="Capture", command=lambda: self.set_mode("capture")).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(controls, text="Continuous", command=lambda: self.set_mode("continuous")).grid(row=0, column=1, padx=(0, 8))
@@ -150,37 +287,61 @@ class GraffitiCaptureGui:
         ttk.Button(controls, text="Save Last", command=self.save_last).grid(row=0, column=5, padx=(0, 8))
         ttk.Button(controls, text="Capture Next", command=self.arm_capture_next).grid(row=0, column=6, padx=(0, 8))
         ttk.Button(controls, text="Cancel Capture", command=lambda: self.send_command("cap off")).grid(row=0, column=7, padx=(0, 8))
-        ttk.Label(controls, text="Shortcuts: c v x l s a g m q").grid(row=0, column=9, sticky="e")
+        ttk.Label(controls, text="Targets").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(controls, textvariable=self.script_targets_var, width=32).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(10, 0), padx=(0, 8))
+        ttk.Label(controls, text="Reps").grid(row=1, column=4, sticky="w", pady=(10, 0))
+        ttk.Spinbox(controls, from_=1, to=50, textvariable=self.script_reps_var, width=5).grid(row=1, column=5, sticky="w", pady=(10, 0), padx=(0, 8))
+        ttk.Button(controls, text="Start Script", command=self.start_scripted_capture).grid(row=1, column=6, pady=(10, 0), padx=(0, 8))
+        ttk.Button(controls, text="Stop Script", command=self.stop_scripted_capture).grid(row=1, column=7, pady=(10, 0), padx=(0, 8))
+        ttk.Label(controls, text="Shortcuts: c v x l s a g m q").grid(row=0, column=11, sticky="e")
+
+        script_frame = ttk.LabelFrame(main, text="Scripted Capture")
+        script_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        script_frame.columnconfigure(1, weight=1)
+        script_frame.columnconfigure(3, weight=1)
+        ttk.Label(script_frame, text="Target").grid(row=0, column=0, sticky="w", padx=(10, 12), pady=(8, 2))
+        tk.Label(script_frame, textvariable=self.script_target_var, font=("Helvetica", 36, "bold"), fg="#0f766e").grid(row=0, column=1, sticky="w", pady=(4, 2))
+        ttk.Label(script_frame, text="Progress").grid(row=0, column=2, sticky="w", padx=(20, 12), pady=(8, 2))
+        ttk.Label(script_frame, textvariable=self.script_progress_var, font=("Helvetica", 18, "bold")).grid(row=0, column=3, sticky="w", pady=(4, 2))
+        ttk.Label(script_frame, textvariable=self.script_status_var).grid(row=1, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 8))
+        ttk.Label(script_frame, textvariable=self.script_detail_var).grid(row=1, column=2, columnspan=2, sticky="w", padx=(20, 10), pady=(0, 8))
 
         live_frame = ttk.LabelFrame(main, text="Live Stroke")
-        live_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        live_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
         live_frame.rowconfigure(0, weight=1)
         live_frame.columnconfigure(0, weight=1)
         self.live_canvas = tk.Canvas(live_frame, bg="#0b0f16", highlightthickness=0)
         self.live_canvas.grid(row=0, column=0, sticky="nsew")
 
         last_frame = ttk.LabelFrame(main, text="Last Stroke")
-        last_frame.grid(row=2, column=1, sticky="nsew", pady=(0, 8))
+        last_frame.grid(row=3, column=1, sticky="nsew", pady=(0, 8))
         last_frame.rowconfigure(0, weight=1)
         last_frame.columnconfigure(0, weight=1)
         self.last_canvas = tk.Canvas(last_frame, bg="#11161c", highlightthickness=0)
         self.last_canvas.grid(row=0, column=0, sticky="nsew")
 
         meta_frame = ttk.LabelFrame(main, text="Stroke Metadata")
-        meta_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8))
+        meta_frame.grid(row=4, column=0, sticky="nsew", padx=(0, 8))
         meta_frame.rowconfigure(0, weight=1)
         meta_frame.columnconfigure(0, weight=1)
         self.meta_text = tk.Text(meta_frame, height=10, wrap="word", state="disabled")
         self.meta_text.grid(row=0, column=0, sticky="nsew")
 
         log_frame = ttk.LabelFrame(main, text="Logs")
-        log_frame.grid(row=3, column=1, sticky="nsew")
+        log_frame.grid(row=4, column=1, sticky="nsew")
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
         self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(main, text=f"Output: {self.output_path.resolve()}").grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(
+            main,
+            text=(
+                f"Raw: {self.output_path.resolve()}   "
+                f"TinyML JSONL: {self.tinyml_jsonl_path.resolve()}   "
+                f"TinyML CSV: {self.tinyml_csv_path.resolve()}"
+            ),
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.live_canvas.bind("<Configure>", lambda _e: self._render_live())
         self.last_canvas.bind("<Configure>", lambda _e: self._render_last())
@@ -217,6 +378,11 @@ class GraffitiCaptureGui:
         self.serial.flush()
         self.log(f"> {command}")
 
+    def _start_live_stream(self) -> None:
+        self.send_command("mode graffiti")
+        self.set_mode("continuous")
+        self.send_command("status")
+
     def set_mode(self, mode: str) -> None:
         if mode == "capture":
             self.send_command("trace once")
@@ -240,18 +406,186 @@ class GraffitiCaptureGui:
             return
         self.send_command(f"cap {label}")
 
-    def save_sample(self, sample: StrokeSample, label: str) -> None:
+    def _script_meta_for_current_target(self) -> dict:
+        if not self.script_state.active:
+            return {
+                "scripted": False,
+                "session_id": "",
+                "target_index": -1,
+                "rep_index": -1,
+                "reps_per_target": 0,
+                "prompt_label": "",
+            }
+        return {
+            "scripted": True,
+            "session_id": self.script_state.session_id,
+            "target_index": self.script_state.target_index,
+            "rep_index": self.script_state.rep_index,
+            "reps_per_target": self.script_state.reps_per_target,
+            "prompt_label": self.script_state.current_target(),
+        }
+
+    def _write_tinyml_csv_row(self, record: dict) -> None:
+        sample_count = record["features"]["sample_count"]
+        headers = [
+            "label",
+            "prompt_label",
+            "session_id",
+            "scripted",
+            "target_index",
+            "rep_index",
+            "reps_per_target",
+            "stroke_id",
+            "status",
+            "pred",
+            "accepted",
+            "score",
+            "dist",
+            "backend",
+            "tok",
+            "seq",
+            "point_count",
+            "duration_ms",
+            "delta_x",
+            "delta_y",
+            "path_length_px",
+            "bbox_w_px",
+            "bbox_h_px",
+        ]
+        for idx in range(sample_count):
+            headers.extend([f"x{idx:02d}", f"y{idx:02d}", f"dx{idx:02d}", f"dy{idx:02d}"])
+
+        row = {
+            "label": record["label"],
+            "prompt_label": record["script"]["prompt_label"],
+            "session_id": record["script"]["session_id"],
+            "scripted": int(bool(record["script"]["scripted"])),
+            "target_index": record["script"]["target_index"],
+            "rep_index": record["script"]["rep_index"],
+            "reps_per_target": record["script"]["reps_per_target"],
+            "stroke_id": record["stroke_id"],
+            "status": record["status"],
+            "pred": record["pred"],
+            "accepted": int(bool(record["accepted"])),
+            "score": record["score"],
+            "dist": record["dist"],
+            "backend": record["backend"],
+            "tok": record["tok"],
+            "seq": record["seq"],
+            "point_count": record["point_count"],
+            "duration_ms": record["duration_ms"],
+            "delta_x": record["delta_x"],
+            "delta_y": record["delta_y"],
+            "path_length_px": record["features"]["path_length_px"],
+            "bbox_w_px": record["features"]["bbox_w_px"],
+            "bbox_h_px": record["features"]["bbox_h_px"],
+        }
+        for idx, (xy, dxy) in enumerate(zip(record["features"]["resampled_xy"], record["features"]["resampled_dxy"])):
+            row[f"x{idx:02d}"] = xy[0]
+            row[f"y{idx:02d}"] = xy[1]
+            row[f"dx{idx:02d}"] = dxy[0]
+            row[f"dy{idx:02d}"] = dxy[1]
+
+        write_header = not self.tinyml_csv_path.exists()
+        with self.tinyml_csv_path.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def save_sample(self, sample: StrokeSample, label: str, script_meta: Optional[dict] = None) -> bool:
+        point_count = sample.point_count or len(sample.points)
+        if point_count < 2:
+            self.log(f"ignored stroke {sample.stroke_id}: not enough points")
+            return False
+        if sample.saved and sample.label == label:
+            self.log(f"stroke {sample.stroke_id} already saved as {label}")
+            return False
+
+        features = derive_feature_payload(sample)
+        if script_meta is None:
+            script_meta = self._script_meta_for_current_target()
+
         record = asdict(sample)
         record["label"] = label
         record["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        record["script"] = script_meta
+        record["features"] = features
         with self.output_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        with self.tinyml_jsonl_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._write_tinyml_csv_row(record)
         sample.label = label
         sample.saved = True
         self.saved_count += 1
         self.saved_var.set(f"Saved: {self.saved_count}")
         self.log(f"saved stroke {sample.stroke_id} as {label}")
         self._render_meta()
+        return True
+
+    def _refresh_script_status(self) -> None:
+        if not self.script_state.active:
+            self.script_status_var.set("Script idle")
+            self.script_target_var.set("-")
+            self.script_progress_var.set("0 / 0")
+            self.script_detail_var.set("Ready")
+            return
+        current = self.script_state.current_target()
+        self.script_target_var.set(current)
+        current_rep = self.script_state.rep_index + 1
+        self.script_progress_var.set(f"{current_rep} / {self.script_state.reps_per_target}")
+        self.script_status_var.set(
+            f"Target {self.script_state.target_index + 1} of {len(self.script_state.targets)}"
+        )
+        self.script_detail_var.set(
+            f"Session {self.script_state.session_id}   saved {self.script_state.total_saved}"
+        )
+
+    def start_scripted_capture(self) -> None:
+        targets = parse_script_targets(self.script_targets_var.get())
+        if not targets:
+            self.log("no scripted targets configured")
+            return
+        reps = max(1, int(self.script_reps_var.get()))
+        self.script_state = ScriptedCaptureState(
+            targets=targets,
+            reps_per_target=reps,
+            session_id=time.strftime("%Y%m%dT%H%M%S"),
+            active=True,
+        )
+        self.autosave_var.set(True)
+        self.label_var.set(self.script_state.current_target())
+        self._refresh_script_status()
+        self.send_command("mode graffiti")
+        self.set_mode("continuous")
+        self.log(f"script started: {len(targets)} targets x {reps} reps")
+
+    def stop_scripted_capture(self) -> None:
+        if self.script_state.active:
+            self.log(f"script stopped after {self.script_state.total_saved} saved samples")
+        self.script_state = ScriptedCaptureState()
+        self._refresh_script_status()
+
+    def _advance_scripted_capture(self) -> None:
+        if not self.script_state.active:
+            return
+        self.script_state.total_saved += 1
+        self.script_state.rep_index += 1
+        if self.script_state.rep_index >= self.script_state.reps_per_target:
+            self.script_state.rep_index = 0
+            self.script_state.target_index += 1
+        if self.script_state.target_index >= len(self.script_state.targets):
+            total = self.script_state.total_saved
+            self.stop_scripted_capture()
+            self.log(f"script complete: {total} samples")
+            return
+        self.label_var.set(self.script_state.current_target())
+        self._refresh_script_status()
+        self.log(
+            f"next target {self.script_state.current_target()} "
+            f"rep {self.script_state.rep_index + 1}/{self.script_state.reps_per_target}"
+        )
 
     def save_last(self) -> None:
         if self.last_stroke is None:
@@ -311,7 +645,14 @@ class GraffitiCaptureGui:
             if sample.trace_mode == "capture" or self.mode_var.get() == "capture":
                 self.mode_var.set("stop")
             self.log(f"trace end #{stroke_id} status={sample.status} pred={sample.pred} score={sample.score:.2f}")
-            if self.autosave_var.get():
+            saved_in_script = False
+            if self.script_state.active:
+                prompt_label = self.script_state.current_target()
+                if prompt_label:
+                    saved_in_script = self.save_sample(sample, prompt_label, script_meta=self._script_meta_for_current_target())
+                    if saved_in_script:
+                        self._advance_scripted_capture()
+            if (not saved_in_script) and self.autosave_var.get():
                 label = self.label_var.get().strip()
                 if label:
                     self.save_sample(sample, label)
@@ -398,6 +739,8 @@ class GraffitiCaptureGui:
                 f"delta_y: {sample.delta_y}",
                 f"saved: {sample.saved}",
                 f"label: {sample.label or '-'}",
+                f"script_target: {self.script_target_var.get()}",
+                f"script_progress: {self.script_progress_var.get()}",
             ]
             self.meta_text.insert("1.0", "\n".join(lines))
         self.meta_text.configure(state="disabled")
