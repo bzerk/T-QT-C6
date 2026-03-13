@@ -7,6 +7,7 @@ import json
 import math
 import queue
 import re
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -26,6 +27,26 @@ TRACE_END_RE = re.compile(
     r"score=([-0-9.]+) dist=([-0-9.]+) backend=([^ ]+) tok=(\d+) seq=([^ ]+) "
     r"points=(\d+) dur=(\d+) dx=(-?\d+) dy=(-?\d+)$"
 )
+CMD_MODE_RE = re.compile(r"^\[cmd\] mode=([A-Z]+)")
+CMD_TRACE_RE = re.compile(r"^\[cmd\] trace=([^ ]+)")
+MODE_SWITCH_RE = re.compile(r"^\[mode\] switched to ([A-Z]+)")
+
+LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
+PUNCT_LABELS = ["SPACE", "BKSP", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
+NUMERIC_LABELS = list("0123456789")
+PUNCT_SET = set(PUNCT_LABELS)
+NUMERIC_SET = set(NUMERIC_LABELS)
+LETTER_SET = set(LETTER_LABELS)
+TARGET_PRESETS = ("letters", "punct", "numeric", "all", "custom")
+TOKEN_ALIASES = {
+    "space": "SPACE",
+    "bksp": "BKSP",
+    "backspace": "BKSP",
+    "apostrophe": "'",
+    "quote": "'",
+    "lparen": "(",
+    "rparen": ")",
+}
 
 
 @dataclass
@@ -46,13 +67,25 @@ class StrokeSample:
     delta_x: int = 0
     delta_y: int = 0
     label: str = ""
+    condition: str = ""
+    capture_uid: str = ""
     saved: bool = False
     captured_at_ms: int = 0
 
 
+@dataclass(frozen=True)
+class PromptSpec:
+    label: str
+    condition: str
+
+    @property
+    def display(self) -> str:
+        return self.label
+
+
 @dataclass
 class ScriptedCaptureState:
-    targets: list[str] = field(default_factory=list)
+    targets: list[PromptSpec] = field(default_factory=list)
     reps_per_target: int = 5
     target_index: int = 0
     rep_index: int = 0
@@ -60,10 +93,17 @@ class ScriptedCaptureState:
     active: bool = False
     total_saved: int = 0
 
-    def current_target(self) -> str:
+    def current_target(self) -> Optional[PromptSpec]:
         if not self.active or self.target_index >= len(self.targets):
-            return ""
+            return None
         return self.targets[self.target_index]
+
+
+@dataclass
+class SavedEntry:
+    capture_uid: str
+    saved_count_before: int
+    script_state_before: ScriptedCaptureState
 
 
 class SerialReader(threading.Thread):
@@ -97,24 +137,91 @@ def autodetect_port() -> Optional[str]:
     return sorted(ports)[0] if ports else None
 
 
-def parse_script_targets(text: str) -> list[str]:
+def normalize_target_token(token: str) -> str:
+    token = token.strip()
+    if not token:
+        return ""
+    alias = TOKEN_ALIASES.get(token.lower())
+    if alias:
+        return alias
+    if len(token) == 1 and token.isalpha():
+        return token.lower()
+    if len(token) == 1:
+        return token
+    return token.upper()
+
+
+def infer_condition(label: str) -> Optional[str]:
+    if label in LETTER_SET:
+        return "letters"
+    if label in PUNCT_SET:
+        return "punct"
+    if label in NUMERIC_SET:
+        return "numeric"
+    return None
+
+
+def parse_script_targets(text: str) -> list[PromptSpec]:
     stripped = text.strip()
     if not stripped:
         return []
-    if re.search(r"[,\s]", stripped):
-        parts = [item.strip() for item in re.split(r"[,\s]+", stripped) if item.strip()]
-    else:
-        parts = list(stripped)
+    parts = [item.strip() for item in re.split(r"[,\s]+", stripped) if item.strip()]
+    if not parts:
+        parts = [stripped]
 
-    targets: list[str] = []
+    prompts: list[PromptSpec] = []
     for part in parts:
-        if len(part) == 1 and part.isalpha():
-            targets.append(part.lower())
-        elif len(part) == 1:
-            targets.append(part)
-        else:
-            targets.append(part.upper())
-    return targets
+        normalized = normalize_target_token(part)
+        if len(part) > 1 and part.isalpha() and normalized not in PUNCT_SET:
+            prompts.extend(PromptSpec(ch, "letters") for ch in part.lower())
+            continue
+        if len(part) > 1 and part.isdigit():
+            prompts.extend(PromptSpec(ch, "numeric") for ch in part)
+            continue
+        condition = infer_condition(normalized)
+        if condition is not None:
+            prompts.append(PromptSpec(normalized, condition))
+    return prompts
+
+
+def prompt_specs_for_preset(preset: str) -> list[PromptSpec]:
+    if preset == "letters":
+        return [PromptSpec(label, "letters") for label in LETTER_LABELS]
+    if preset == "punct":
+        return [PromptSpec(label, "punct") for label in PUNCT_LABELS]
+    if preset == "numeric":
+        return [PromptSpec(label, "numeric") for label in NUMERIC_LABELS]
+    if preset == "all":
+        return (
+            [PromptSpec(label, "letters") for label in LETTER_LABELS]
+            + [PromptSpec(label, "punct") for label in PUNCT_LABELS]
+            + [PromptSpec(label, "numeric") for label in NUMERIC_LABELS]
+        )
+    return []
+
+
+def target_text_for_preset(preset: str) -> str:
+    if preset == "letters":
+        return "".join(LETTER_LABELS)
+    if preset == "punct":
+        return " ".join(PUNCT_LABELS)
+    if preset == "numeric":
+        return "".join(NUMERIC_LABELS)
+    if preset == "all":
+        return " ".join(LETTER_LABELS + PUNCT_LABELS + NUMERIC_LABELS)
+    return ""
+
+
+def clone_script_state(state: ScriptedCaptureState) -> ScriptedCaptureState:
+    return ScriptedCaptureState(
+        targets=list(state.targets),
+        reps_per_target=state.reps_per_target,
+        target_index=state.target_index,
+        rep_index=state.rep_index,
+        session_id=state.session_id,
+        active=state.active,
+        total_saved=state.total_saved,
+    )
 
 
 def resample_stroke(points: list[list[int]], sample_count: int = 32) -> list[tuple[float, float]]:
@@ -216,42 +323,59 @@ class GraffitiCaptureGui:
         self.tinyml_jsonl_path = self.output_path.parent / "tinyml_dataset.jsonl"
         self.tinyml_csv_path = self.output_path.parent / "tinyml_dataset.csv"
 
-        self.serial = serial.Serial(port_name, baudrate=baud, timeout=0.10)
+        self.serial: Optional[serial.Serial] = None
+        self.reader: Optional[SerialReader] = None
         self.events: queue.Queue = queue.Queue()
-        self.reader = SerialReader(self.serial, self.events)
 
         self.mode_var = tk.StringVar(value="stop")
+        self.preset_var = tk.StringVar(value="letters")
         self.label_var = tk.StringVar(value="")
         self.autosave_var = tk.BooleanVar(value=False)
         self.port_var = tk.StringVar(value=port_name)
-        self.status_var = tk.StringVar(value="Connecting...")
-        self.output_var = tk.StringVar(value=str(output_path.resolve()))
+        self.status_var = tk.StringVar(value="Waiting for device...")
         self.saved_var = tk.StringVar(value="Saved: 0")
-        self.script_targets_var = tk.StringVar(value="abcdefghijklmnopqrstuvwxyz")
+        self.script_targets_var = tk.StringVar(value=target_text_for_preset("letters"))
         self.script_reps_var = tk.IntVar(value=5)
         self.script_status_var = tk.StringVar(value="Script idle")
         self.script_target_var = tk.StringVar(value="-")
+        self.script_condition_var = tk.StringVar(value="-")
         self.script_progress_var = tk.StringVar(value="0 / 0")
-        self.script_detail_var = tk.StringVar(value="Ready")
+        self.script_detail_var = tk.StringVar(value="Waiting for device")
 
         self.saved_count = 0
         self.current_stroke: Optional[StrokeSample] = None
         self.last_stroke: Optional[StrokeSample] = None
         self.label_entry: Optional[ttk.Entry] = None
         self.script_state = ScriptedCaptureState()
+        self.undo_stack: list[SavedEntry] = []
+        self.device_ready = False
+        self._connect_retry_after_id: Optional[str] = None
+        self._configure_generation = 0
+        self._configure_reason = ""
+        self._configure_pending = False
+        self._configure_mode_ack = False
+        self._configure_trace_ack = False
+        self._configure_status_ack = False
+        self._ready_callbacks: list = []
+        self._last_mode_value = ""
+        self._last_trace_value = ""
+        self._last_error_message = ""
+        self.device_action_widgets: list[tk.Widget] = []
+        self._closing = False
 
         self._build_ui()
         self._refresh_script_status()
         self._bind_keys()
-        self.reader.start()
-        self.log(f"opened {self.port_name} @ {self.baud}")
-        self.root.after(150, self._start_live_stream)
+        self._load_existing_saved_entries()
+        self._set_device_ready(False, "Waiting for device...")
+        self._attempt_connect()
         self.root.after(30, self._poll_events)
+        self.root.after(100, self._tick)
 
     def _build_ui(self) -> None:
         self.root.title("Ringo Graffiti Capture")
-        self.root.geometry("1180x760")
-        self.root.minsize(960, 640)
+        self.root.geometry("1260x820")
+        self.root.minsize(1040, 700)
 
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
@@ -262,49 +386,82 @@ class GraffitiCaptureGui:
 
         top = ttk.Frame(main)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        top.columnconfigure(7, weight=1)
+        top.columnconfigure(9, weight=1)
 
         ttk.Label(top, text="Port").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.port_var, state="readonly", width=22).grid(row=0, column=1, sticky="w", padx=(4, 12))
-        ttk.Label(top, text="Label").grid(row=0, column=2, sticky="w")
+        ttk.Label(top, text="Preset").grid(row=0, column=2, sticky="w")
+        preset_combo = ttk.Combobox(top, textvariable=self.preset_var, values=TARGET_PRESETS, state="readonly", width=10)
+        preset_combo.grid(row=0, column=3, sticky="w", padx=(4, 12))
+        preset_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_preset())
+        ttk.Label(top, text="Label").grid(row=0, column=4, sticky="w")
         self.label_entry = ttk.Entry(top, textvariable=self.label_var, width=18)
-        self.label_entry.grid(row=0, column=3, sticky="w", padx=(4, 12))
-        ttk.Checkbutton(top, text="Autosave", variable=self.autosave_var).grid(row=0, column=4, sticky="w", padx=(0, 12))
-        ttk.Label(top, textvariable=self.saved_var).grid(row=0, column=5, sticky="w", padx=(0, 12))
-        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=6, sticky="w")
+        self.label_entry.grid(row=0, column=5, sticky="w", padx=(4, 12))
+        ttk.Checkbutton(top, text="Autosave", variable=self.autosave_var).grid(row=0, column=6, sticky="w", padx=(0, 12))
+        ttk.Label(top, textvariable=self.saved_var).grid(row=0, column=7, sticky="w", padx=(0, 12))
+        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=8, sticky="w")
 
         controls = ttk.Frame(main)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        for idx in range(12):
+        for idx in range(14):
             controls.columnconfigure(idx, weight=0)
-        controls.columnconfigure(11, weight=1)
+        controls.columnconfigure(13, weight=1)
 
-        ttk.Button(controls, text="Capture", command=lambda: self.set_mode("capture")).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(controls, text="Continuous", command=lambda: self.set_mode("continuous")).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(controls, text="Stop", command=lambda: self.set_mode("stop")).grid(row=0, column=2, padx=(0, 20))
-        ttk.Button(controls, text="Graffiti Mode", command=lambda: self.send_command("mode graffiti")).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(controls, text="Mouse Mode", command=lambda: self.send_command("mode mouse")).grid(row=0, column=4, padx=(0, 20))
-        ttk.Button(controls, text="Save Last", command=self.save_last).grid(row=0, column=5, padx=(0, 8))
-        ttk.Button(controls, text="Capture Next", command=self.arm_capture_next).grid(row=0, column=6, padx=(0, 8))
-        ttk.Button(controls, text="Cancel Capture", command=lambda: self.send_command("cap off")).grid(row=0, column=7, padx=(0, 8))
+        self.capture_btn = ttk.Button(controls, text="Capture", command=lambda: self.set_mode("capture"))
+        self.capture_btn.grid(row=0, column=0, padx=(0, 8))
+        self.continuous_btn = ttk.Button(controls, text="Continuous", command=lambda: self.set_mode("continuous"))
+        self.continuous_btn.grid(row=0, column=1, padx=(0, 8))
+        self.stop_btn = ttk.Button(controls, text="Stop", command=lambda: self.set_mode("stop"))
+        self.stop_btn.grid(row=0, column=2, padx=(0, 20))
+        self.graffiti_btn = ttk.Button(controls, text="Graffiti Mode", command=lambda: self.send_command("mode graffiti"))
+        self.graffiti_btn.grid(row=0, column=3, padx=(0, 8))
+        self.mouse_btn = ttk.Button(controls, text="Mouse Mode", command=lambda: self.send_command("mode mouse"))
+        self.mouse_btn.grid(row=0, column=4, padx=(0, 20))
+        self.save_last_btn = ttk.Button(controls, text="Save Last", command=self.save_last)
+        self.save_last_btn.grid(row=0, column=5, padx=(0, 8))
+        self.capture_next_btn = ttk.Button(controls, text="Capture Next", command=self.arm_capture_next)
+        self.capture_next_btn.grid(row=0, column=6, padx=(0, 8))
+        self.cancel_capture_btn = ttk.Button(controls, text="Cancel Capture", command=lambda: self.send_command("cap off"))
+        self.cancel_capture_btn.grid(row=0, column=7, padx=(0, 8))
+        self.undo_btn = ttk.Button(controls, text="Undo Last", command=self.undo_last)
+        self.undo_btn.grid(row=0, column=8, padx=(0, 8))
         ttk.Label(controls, text="Targets").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(controls, textvariable=self.script_targets_var, width=32).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(10, 0), padx=(0, 8))
-        ttk.Label(controls, text="Reps").grid(row=1, column=4, sticky="w", pady=(10, 0))
-        ttk.Spinbox(controls, from_=1, to=50, textvariable=self.script_reps_var, width=5).grid(row=1, column=5, sticky="w", pady=(10, 0), padx=(0, 8))
-        ttk.Button(controls, text="Start Script", command=self.start_scripted_capture).grid(row=1, column=6, pady=(10, 0), padx=(0, 8))
-        ttk.Button(controls, text="Stop Script", command=self.stop_scripted_capture).grid(row=1, column=7, pady=(10, 0), padx=(0, 8))
-        ttk.Label(controls, text="Shortcuts: c v x l s a g m q").grid(row=0, column=11, sticky="e")
+        ttk.Entry(controls, textvariable=self.script_targets_var, width=48).grid(row=1, column=1, columnspan=5, sticky="ew", pady=(10, 0), padx=(0, 8))
+        ttk.Label(controls, text="Reps").grid(row=1, column=6, sticky="w", pady=(10, 0))
+        ttk.Spinbox(controls, from_=1, to=50, textvariable=self.script_reps_var, width=5).grid(row=1, column=7, sticky="w", pady=(10, 0), padx=(0, 8))
+        self.start_script_btn = ttk.Button(controls, text="Start Script", command=self.start_scripted_capture)
+        self.start_script_btn.grid(row=1, column=8, pady=(10, 0), padx=(0, 8))
+        self.stop_script_btn = ttk.Button(controls, text="Stop Script", command=self.stop_scripted_capture)
+        self.stop_script_btn.grid(row=1, column=9, pady=(10, 0), padx=(0, 8))
+        ttk.Label(controls, text="Shortcuts: c v x l s g m u q").grid(row=0, column=13, sticky="e")
+
+        self.device_action_widgets = [
+            self.capture_btn,
+            self.continuous_btn,
+            self.stop_btn,
+            self.graffiti_btn,
+            self.mouse_btn,
+            self.save_last_btn,
+            self.capture_next_btn,
+            self.cancel_capture_btn,
+            self.undo_btn,
+            self.start_script_btn,
+            self.stop_script_btn,
+        ]
 
         script_frame = ttk.LabelFrame(main, text="Scripted Capture")
         script_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         script_frame.columnconfigure(1, weight=1)
         script_frame.columnconfigure(3, weight=1)
+        script_frame.columnconfigure(5, weight=1)
         ttk.Label(script_frame, text="Target").grid(row=0, column=0, sticky="w", padx=(10, 12), pady=(8, 2))
         tk.Label(script_frame, textvariable=self.script_target_var, font=("Helvetica", 36, "bold"), fg="#0f766e").grid(row=0, column=1, sticky="w", pady=(4, 2))
-        ttk.Label(script_frame, text="Progress").grid(row=0, column=2, sticky="w", padx=(20, 12), pady=(8, 2))
-        ttk.Label(script_frame, textvariable=self.script_progress_var, font=("Helvetica", 18, "bold")).grid(row=0, column=3, sticky="w", pady=(4, 2))
-        ttk.Label(script_frame, textvariable=self.script_status_var).grid(row=1, column=0, columnspan=2, sticky="w", padx=(10, 10), pady=(0, 8))
-        ttk.Label(script_frame, textvariable=self.script_detail_var).grid(row=1, column=2, columnspan=2, sticky="w", padx=(20, 10), pady=(0, 8))
+        ttk.Label(script_frame, text="Condition").grid(row=0, column=2, sticky="w", padx=(20, 12), pady=(8, 2))
+        ttk.Label(script_frame, textvariable=self.script_condition_var, font=("Helvetica", 18, "bold")).grid(row=0, column=3, sticky="w", pady=(4, 2))
+        ttk.Label(script_frame, text="Progress").grid(row=0, column=4, sticky="w", padx=(20, 12), pady=(8, 2))
+        ttk.Label(script_frame, textvariable=self.script_progress_var, font=("Helvetica", 18, "bold")).grid(row=0, column=5, sticky="w", pady=(4, 2))
+        ttk.Label(script_frame, textvariable=self.script_status_var).grid(row=1, column=0, columnspan=3, sticky="w", padx=(10, 10), pady=(0, 8))
+        ttk.Label(script_frame, textvariable=self.script_detail_var).grid(row=1, column=3, columnspan=3, sticky="w", padx=(20, 10), pady=(0, 8))
 
         live_frame = ttk.LabelFrame(main, text="Live Stroke")
         live_frame.grid(row=3, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
@@ -345,7 +502,6 @@ class GraffitiCaptureGui:
 
         self.live_canvas.bind("<Configure>", lambda _e: self._render_live())
         self.last_canvas.bind("<Configure>", lambda _e: self._render_last())
-
         self.label_entry.focus_set()
 
     def _bind_keys(self) -> None:
@@ -354,8 +510,8 @@ class GraffitiCaptureGui:
         self.root.bind("<KeyPress-x>", lambda _e: self.set_mode("stop"))
         self.root.bind("<KeyPress-g>", lambda _e: self.send_command("mode graffiti"))
         self.root.bind("<KeyPress-m>", lambda _e: self.send_command("mode mouse"))
-        self.root.bind("<KeyPress-a>", lambda _e: self.toggle_autosave())
         self.root.bind("<KeyPress-s>", lambda _e: self.save_last())
+        self.root.bind("<KeyPress-u>", lambda _e: self.undo_last())
         self.root.bind("<KeyPress-q>", lambda _e: self.close())
         self.root.bind("<KeyPress-l>", lambda _e: self.focus_label())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -373,15 +529,217 @@ class GraffitiCaptureGui:
         self.log_text.see("1.0")
         self.status_var.set(message)
 
-    def send_command(self, command: str) -> None:
-        self.serial.write((command + "\n").encode("utf-8"))
-        self.serial.flush()
-        self.log(f"> {command}")
+    def _set_device_ready(self, ready: bool, status: Optional[str] = None) -> None:
+        self.device_ready = ready
+        for widget in self.device_action_widgets:
+            widget.configure(state="normal" if ready else "disabled")
+        if self.label_entry is not None:
+            self.label_entry.configure(state="normal")
+        if status:
+            self.status_var.set(status)
+            if not self.script_state.active:
+                self.script_detail_var.set(status)
 
-    def _start_live_stream(self) -> None:
-        self.send_command("mode graffiti")
-        self.set_mode("continuous")
-        self.send_command("status")
+    def _apply_preset(self) -> None:
+        preset = self.preset_var.get()
+        if preset != "custom":
+            self.script_targets_var.set(target_text_for_preset(preset))
+
+    def _load_existing_saved_entries(self) -> None:
+        if not self.output_path.exists():
+            self.saved_var.set("Saved: 0")
+            return
+
+        saved_count = 0
+        undo_stack: list[SavedEntry] = []
+        with self.output_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                saved_count += 1
+                capture_uid = record.get("capture_uid")
+                if not capture_uid:
+                    continue
+                script = record.get("script", {})
+                prompts = parse_script_targets(script.get("prompt_label", "")) if not script.get("scripted") else []
+                prior_state = ScriptedCaptureState(
+                    targets=prompts,
+                    reps_per_target=int(script.get("reps_per_target", 0) or 0),
+                    target_index=int(script.get("target_index", -1) or -1),
+                    rep_index=int(script.get("rep_index", -1) or -1),
+                    session_id=script.get("session_id", ""),
+                    active=bool(script.get("scripted", False)) and bool(prompts),
+                    total_saved=max(0, saved_count - 1),
+                )
+                undo_stack.append(
+                    SavedEntry(
+                        capture_uid=capture_uid,
+                        saved_count_before=max(0, saved_count - 1),
+                        script_state_before=prior_state,
+                    )
+                )
+
+        self.saved_count = saved_count
+        self.undo_stack = undo_stack
+        self.saved_var.set(f"Saved: {self.saved_count}")
+
+    def _attempt_connect(self) -> None:
+        if self.serial is not None:
+            return
+        candidate_ports: list[str] = []
+        if self.port_name:
+            candidate_ports.append(self.port_name)
+        detected = autodetect_port()
+        if detected and detected not in candidate_ports:
+            candidate_ports.append(detected)
+        if not candidate_ports:
+            self._set_device_ready(False, "Waiting for device...")
+            self._schedule_reconnect()
+            return
+
+        last_exc: Optional[Exception] = None
+        for candidate in candidate_ports:
+            try:
+                self.serial = serial.Serial(candidate, baudrate=self.baud, timeout=0.10)
+                self.port_name = candidate
+                break
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                last_exc = exc
+                self.serial = None
+
+        if self.serial is None:
+            msg = f"waiting for device: {last_exc}" if last_exc is not None else "waiting for device"
+            if msg != self._last_error_message:
+                self.log(msg)
+                self._last_error_message = msg
+            self._set_device_ready(False, "Waiting for device...")
+            self._schedule_reconnect()
+            return
+
+        try:
+            self.serial.dtr = False
+            self.serial.rts = False
+            self.port_var.set(self.port_name)
+            self.events = queue.Queue()
+            self.reader = SerialReader(self.serial, self.events)
+            self.reader.start()
+            self._last_error_message = ""
+            self.log(f"opened {self.port_name} @ {self.baud}")
+            self._set_device_ready(False, "Connected; waiting for boot...")
+            self.root.after(2500, lambda: self._configure_device(reason="startup", force=True))
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            self.serial = None
+            self.reader = None
+            msg = f"waiting for device: {exc}"
+            if msg != self._last_error_message:
+                self.log(msg)
+                self._last_error_message = msg
+            self._set_device_ready(False, "Waiting for device...")
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self._connect_retry_after_id is not None:
+            return
+        self._connect_retry_after_id = self.root.after(1000, self._retry_connect)
+
+    def _retry_connect(self) -> None:
+        self._connect_retry_after_id = None
+        if self.serial is None:
+            self._attempt_connect()
+
+    def _disconnect_serial(self) -> None:
+        if self.reader is not None:
+            self.reader.stop()
+            self.reader = None
+        if self.serial is not None:
+            try:
+                self.serial.close()
+            except Exception:
+                pass
+            self.serial = None
+        self._configure_pending = False
+        self._configure_mode_ack = False
+        self._configure_trace_ack = False
+        self._configure_status_ack = False
+        self._set_device_ready(False, "Disconnected; retrying...")
+
+    def _configure_device(self, reason: str = "startup", force: bool = False, on_ready=None) -> None:
+        if on_ready is not None:
+            self._ready_callbacks.append(on_ready)
+        if self.device_ready and not force:
+            self._run_ready_callbacks()
+            return
+        if self.serial is None:
+            self._schedule_reconnect()
+            return
+        self._configure_generation += 1
+        self._configure_reason = reason
+        self._configure_pending = True
+        self._configure_mode_ack = False
+        self._configure_trace_ack = False
+        self._configure_status_ack = False
+        self._set_device_ready(False, "Configuring device...")
+        self.send_command("mode graffiti", user_visible=False)
+        self.root.after(80, lambda: self.send_command("trace cont", user_visible=False))
+        self.root.after(160, lambda: self.send_command("status", user_visible=False))
+        current_generation = self._configure_generation
+        self.root.after(3000, lambda: self._configuration_timeout(current_generation))
+
+    def _configuration_timeout(self, generation: int) -> None:
+        if generation != self._configure_generation or self.device_ready or not self._configure_pending:
+            return
+        self.log(f"device configuration timed out during {self._configure_reason}; retrying setup")
+        if self.serial is not None:
+            self._configure_device(reason=self._configure_reason, force=True)
+            return
+        self._disconnect_serial()
+        self._schedule_reconnect()
+
+    def _run_ready_callbacks(self) -> None:
+        callbacks = list(self._ready_callbacks)
+        self._ready_callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:
+                self.log(f"ready callback failed: {exc}")
+
+    def _mark_device_ready(self, source: str = "device") -> None:
+        if self._configure_pending:
+            if not (self._configure_mode_ack and self._configure_trace_ack and self._configure_status_ack):
+                return
+            self._configure_pending = False
+        if not self.device_ready:
+            self._set_device_ready(True, f"Ready ({source})")
+            self.log(f"device ready via {source}")
+        self._run_ready_callbacks()
+
+    def send_command(self, command: str, user_visible: bool = True) -> None:
+        if self.serial is None:
+            if user_visible:
+                self.log("device not connected")
+            return
+        try:
+            self.serial.write((command + "\n").encode("utf-8"))
+            self.serial.flush()
+            if user_visible:
+                self.log(f"> {command}")
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            self.log(f"serial write failed: {exc}")
+            self._disconnect_serial()
+            self._schedule_reconnect()
+
+    def _tick(self) -> None:
+        if self._closing:
+            return
+        if self.serial is None and self._connect_retry_after_id is None:
+            self._schedule_reconnect()
+        self.root.after(250, self._tick)
 
     def set_mode(self, mode: str) -> None:
         if mode == "capture":
@@ -395,19 +753,15 @@ class GraffitiCaptureGui:
             self.mode_var.set("stop")
         self.status_var.set(f"mode={self.mode_var.get()}")
 
-    def toggle_autosave(self) -> None:
-        self.autosave_var.set(not self.autosave_var.get())
-        self.log(f"autosave {'on' if self.autosave_var.get() else 'off'}")
-
     def arm_capture_next(self) -> None:
-        label = self.label_var.get().strip()
-        if not label:
-            self.log("set a label first")
+        label = normalize_target_token(self.label_var.get())
+        if infer_condition(label) is None:
+            self.log("set a valid label first")
             return
         self.send_command(f"cap {label}")
 
-    def _script_meta_for_current_target(self) -> dict:
-        if not self.script_state.active:
+    def _script_meta_for_prompt(self, prompt: Optional[PromptSpec]) -> dict:
+        if not self.script_state.active or prompt is None:
             return {
                 "scripted": False,
                 "session_id": "",
@@ -422,13 +776,33 @@ class GraffitiCaptureGui:
             "target_index": self.script_state.target_index,
             "rep_index": self.script_state.rep_index,
             "reps_per_target": self.script_state.reps_per_target,
-            "prompt_label": self.script_state.current_target(),
+            "prompt_label": prompt.label,
         }
+
+    def _ensure_tinyml_csv_schema(self, headers: list[str]) -> None:
+        if not self.tinyml_csv_path.exists():
+            return
+        if self.tinyml_csv_path.stat().st_size == 0:
+            return
+        with self.tinyml_csv_path.open("r", newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            existing_headers = next(reader, [])
+        if not existing_headers:
+            return
+        if existing_headers == headers:
+            return
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        backup_path = self.tinyml_csv_path.with_name(f"{self.tinyml_csv_path.name}.bak-{stamp}")
+        shutil.copy2(self.tinyml_csv_path, backup_path)
+        self.tinyml_csv_path.write_text("", encoding="utf-8")
+        self.log(f"backed up mismatched CSV schema to {backup_path.name}")
 
     def _write_tinyml_csv_row(self, record: dict) -> None:
         sample_count = record["features"]["sample_count"]
         headers = [
+            "capture_uid",
             "label",
+            "condition",
             "prompt_label",
             "session_id",
             "scripted",
@@ -454,9 +828,12 @@ class GraffitiCaptureGui:
         ]
         for idx in range(sample_count):
             headers.extend([f"x{idx:02d}", f"y{idx:02d}", f"dx{idx:02d}", f"dy{idx:02d}"])
+        self._ensure_tinyml_csv_schema(headers)
 
         row = {
+            "capture_uid": record["capture_uid"],
             "label": record["label"],
+            "condition": record["condition"],
             "prompt_label": record["script"]["prompt_label"],
             "session_id": record["script"]["session_id"],
             "scripted": int(bool(record["script"]["scripted"])),
@@ -493,73 +870,169 @@ class GraffitiCaptureGui:
                 writer.writeheader()
             writer.writerow(row)
 
-    def save_sample(self, sample: StrokeSample, label: str, script_meta: Optional[dict] = None) -> bool:
+    def _append_jsonl(self, path: Path, record: dict) -> None:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def save_sample(
+        self,
+        sample: StrokeSample,
+        label: str,
+        condition: str,
+        script_meta: Optional[dict] = None,
+        script_state_before: Optional[ScriptedCaptureState] = None,
+    ) -> bool:
         point_count = sample.point_count or len(sample.points)
         if point_count < 2:
             self.log(f"ignored stroke {sample.stroke_id}: not enough points")
             return False
-        if sample.saved and sample.label == label:
+        if sample.saved and sample.label == label and sample.condition == condition:
             self.log(f"stroke {sample.stroke_id} already saved as {label}")
             return False
 
         features = derive_feature_payload(sample)
         if script_meta is None:
-            script_meta = self._script_meta_for_current_target()
+            script_meta = self._script_meta_for_prompt(None)
+        if script_state_before is None:
+            script_state_before = clone_script_state(self.script_state)
 
+        capture_uid = f"{int(time.time() * 1000)}-{sample.stroke_id}"
         record = asdict(sample)
+        record["capture_uid"] = capture_uid
         record["label"] = label
+        record["condition"] = condition
         record["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         record["script"] = script_meta
         record["features"] = features
-        with self.output_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-        with self.tinyml_jsonl_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._append_jsonl(self.output_path, record)
+        self._append_jsonl(self.tinyml_jsonl_path, record)
         self._write_tinyml_csv_row(record)
+
         sample.label = label
+        sample.condition = condition
+        sample.capture_uid = capture_uid
         sample.saved = True
+        self.undo_stack.append(
+            SavedEntry(
+                capture_uid=capture_uid,
+                saved_count_before=self.saved_count,
+                script_state_before=script_state_before,
+            )
+        )
         self.saved_count += 1
         self.saved_var.set(f"Saved: {self.saved_count}")
-        self.log(f"saved stroke {sample.stroke_id} as {label}")
+        self.log(f"saved stroke {sample.stroke_id} as {label} ({condition})")
         self._render_meta()
         return True
 
+    def _remove_last_jsonl_entry(self, path: Path, capture_uid: str) -> bool:
+        if not path.exists():
+            return False
+        lines = path.read_text(encoding="utf-8").splitlines()
+        removed = False
+        for idx in range(len(lines) - 1, -1, -1):
+            try:
+                if json.loads(lines[idx]).get("capture_uid") == capture_uid:
+                    del lines[idx]
+                    removed = True
+                    break
+            except Exception:
+                continue
+        if removed:
+            path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        return removed
+
+    def _remove_last_csv_entry(self, path: Path, capture_uid: str) -> bool:
+        if not path.exists():
+            return False
+        with path.open("r", newline="", encoding="utf-8") as fh:
+            reader = list(csv.DictReader(fh))
+            headers = reader[0].keys() if reader else None
+        removed = False
+        for idx in range(len(reader) - 1, -1, -1):
+            if reader[idx].get("capture_uid") == capture_uid:
+                del reader[idx]
+                removed = True
+                break
+        if removed and headers is not None:
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(headers))
+                writer.writeheader()
+                writer.writerows(reader)
+        elif removed and headers is None:
+            path.write_text("", encoding="utf-8")
+        return removed
+
+    def undo_last(self) -> None:
+        if not self.undo_stack:
+            self.log("nothing to undo")
+            return
+        entry = self.undo_stack.pop()
+        removed_raw = self._remove_last_jsonl_entry(self.output_path, entry.capture_uid)
+        removed_jsonl = self._remove_last_jsonl_entry(self.tinyml_jsonl_path, entry.capture_uid)
+        removed_csv = self._remove_last_csv_entry(self.tinyml_csv_path, entry.capture_uid)
+        self.saved_count = entry.saved_count_before
+        self.saved_var.set(f"Saved: {self.saved_count}")
+        self.script_state = clone_script_state(entry.script_state_before)
+        self._refresh_script_status()
+        prompt = self.script_state.current_target()
+        if prompt is not None:
+            self.label_var.set(prompt.label)
+        if self.last_stroke and self.last_stroke.capture_uid == entry.capture_uid:
+            self.last_stroke.saved = False
+            self.last_stroke.capture_uid = ""
+        self.log(
+            f"undo {entry.capture_uid}: raw={int(removed_raw)} tinyml_jsonl={int(removed_jsonl)} csv={int(removed_csv)}"
+        )
+        self._render_meta()
+
     def _refresh_script_status(self) -> None:
-        if not self.script_state.active:
+        current = self.script_state.current_target()
+        if current is None:
             self.script_status_var.set("Script idle")
             self.script_target_var.set("-")
+            self.script_condition_var.set("-")
             self.script_progress_var.set("0 / 0")
-            self.script_detail_var.set("Ready")
+            self.script_detail_var.set("Ready" if self.device_ready else "Waiting for device")
             return
-        current = self.script_state.current_target()
-        self.script_target_var.set(current)
-        current_rep = self.script_state.rep_index + 1
-        self.script_progress_var.set(f"{current_rep} / {self.script_state.reps_per_target}")
-        self.script_status_var.set(
-            f"Target {self.script_state.target_index + 1} of {len(self.script_state.targets)}"
-        )
+        self.script_target_var.set(current.display)
+        self.script_condition_var.set(current.condition)
+        self.script_progress_var.set(f"{self.script_state.rep_index + 1} / {self.script_state.reps_per_target}")
+        self.script_status_var.set(f"Target {self.script_state.target_index + 1} of {len(self.script_state.targets)}")
         self.script_detail_var.set(
             f"Session {self.script_state.session_id}   saved {self.script_state.total_saved}"
         )
 
-    def start_scripted_capture(self) -> None:
-        targets = parse_script_targets(self.script_targets_var.get())
-        if not targets:
-            self.log("no scripted targets configured")
-            return
-        reps = max(1, int(self.script_reps_var.get()))
+    def _begin_scripted_capture(self, targets: list[PromptSpec], reps: int) -> None:
         self.script_state = ScriptedCaptureState(
             targets=targets,
             reps_per_target=reps,
             session_id=time.strftime("%Y%m%dT%H%M%S"),
             active=True,
         )
+        current = self.script_state.current_target()
+        if current is not None:
+            self.label_var.set(current.label)
         self.autosave_var.set(True)
-        self.label_var.set(self.script_state.current_target())
         self._refresh_script_status()
-        self.send_command("mode graffiti")
-        self.set_mode("continuous")
         self.log(f"script started: {len(targets)} targets x {reps} reps")
+
+    def start_scripted_capture(self) -> None:
+        preset = self.preset_var.get()
+        if preset == "custom":
+            targets = parse_script_targets(self.script_targets_var.get())
+        else:
+            targets = prompt_specs_for_preset(preset)
+            self.script_targets_var.set(target_text_for_preset(preset))
+        if not targets:
+            self.log("no scripted targets configured")
+            return
+        reps = max(1, int(self.script_reps_var.get()))
+        self._configure_device(
+            reason="script start",
+            force=True,
+            on_ready=lambda: self._begin_scripted_capture(targets, reps),
+        )
 
     def stop_scripted_capture(self) -> None:
         if self.script_state.active:
@@ -580,26 +1053,55 @@ class GraffitiCaptureGui:
             self.stop_scripted_capture()
             self.log(f"script complete: {total} samples")
             return
-        self.label_var.set(self.script_state.current_target())
+        current = self.script_state.current_target()
+        if current is not None:
+            self.label_var.set(current.label)
         self._refresh_script_status()
-        self.log(
-            f"next target {self.script_state.current_target()} "
-            f"rep {self.script_state.rep_index + 1}/{self.script_state.reps_per_target}"
-        )
+        if current is not None:
+            self.log(
+                f"next target {current.label} ({current.condition}) rep {self.script_state.rep_index + 1}/{self.script_state.reps_per_target}"
+            )
 
     def save_last(self) -> None:
         if self.last_stroke is None:
             self.log("no stroke to save")
             return
-        label = self.label_var.get().strip()
-        if not label:
-            self.log("set a label first")
+        label = normalize_target_token(self.label_var.get())
+        condition = infer_condition(label)
+        if condition is None:
+            self.log("set a valid label first")
             return
-        self.save_sample(self.last_stroke, label)
+        self.save_sample(self.last_stroke, label, condition)
 
     def process_line(self, line: str) -> None:
         if not line:
             return
+        mode_match = CMD_MODE_RE.match(line)
+        if mode_match:
+            self._last_mode_value = mode_match.group(1).lower()
+            self._configure_status_ack = True
+            if self._last_mode_value == "graffiti":
+                self._configure_mode_ack = True
+            self.log(line)
+            self._mark_device_ready("status")
+            return
+        trace_match = CMD_TRACE_RE.match(line)
+        if trace_match:
+            self._last_trace_value = trace_match.group(1).lower()
+            if self._last_trace_value in {"cont", "continuous"}:
+                self._configure_trace_ack = True
+            self.log(line)
+            self._mark_device_ready("trace")
+            return
+        mode_switch_match = MODE_SWITCH_RE.match(line)
+        if mode_switch_match:
+            self._last_mode_value = mode_switch_match.group(1).lower()
+            if self._last_mode_value == "graffiti":
+                self._configure_mode_ack = True
+            self.log(line)
+            self._mark_device_ready("mode")
+            return
+
         match = TRACE_BEGIN_RE.match(line)
         if match:
             stroke_id = int(match.group(1))
@@ -618,9 +1120,7 @@ class GraffitiCaptureGui:
             stroke_id = int(match.group(1))
             if self.current_stroke is None or self.current_stroke.stroke_id != stroke_id:
                 self.current_stroke = StrokeSample(stroke_id=stroke_id, captured_at_ms=int(time.time() * 1000))
-            self.current_stroke.points.append(
-                [int(match.group(2)), int(match.group(3)), int(match.group(4))]
-            )
+            self.current_stroke.points.append([int(match.group(2)), int(match.group(3)), int(match.group(4))])
             self._render_live()
             return
 
@@ -646,16 +1146,23 @@ class GraffitiCaptureGui:
                 self.mode_var.set("stop")
             self.log(f"trace end #{stroke_id} status={sample.status} pred={sample.pred} score={sample.score:.2f}")
             saved_in_script = False
-            if self.script_state.active:
-                prompt_label = self.script_state.current_target()
-                if prompt_label:
-                    saved_in_script = self.save_sample(sample, prompt_label, script_meta=self._script_meta_for_current_target())
-                    if saved_in_script:
-                        self._advance_scripted_capture()
-            if (not saved_in_script) and self.autosave_var.get():
-                label = self.label_var.get().strip()
-                if label:
-                    self.save_sample(sample, label)
+            prompt = self.script_state.current_target()
+            if prompt is not None:
+                state_before = clone_script_state(self.script_state)
+                saved_in_script = self.save_sample(
+                    sample,
+                    prompt.label,
+                    prompt.condition,
+                    script_meta=self._script_meta_for_prompt(prompt),
+                    script_state_before=state_before,
+                )
+                if saved_in_script:
+                    self._advance_scripted_capture()
+            elif self.autosave_var.get():
+                label = normalize_target_token(self.label_var.get())
+                condition = infer_condition(label)
+                if condition is not None:
+                    self.save_sample(sample, label, condition)
             self._render_live()
             self._render_last()
             self._render_meta()
@@ -673,6 +1180,8 @@ class GraffitiCaptureGui:
                 self.process_line(payload)
             else:
                 self.log(f"serial error: {payload}")
+                self._disconnect_serial()
+                self._schedule_reconnect()
         self.root.after(30, self._poll_events)
 
     def _draw_sample(self, canvas: tk.Canvas, sample: Optional[StrokeSample], bg: str) -> None:
@@ -707,8 +1216,16 @@ class GraffitiCaptureGui:
         end_x, end_y = coords[-2], coords[-1]
         canvas.create_oval(start_x - 5, start_y - 5, start_x + 5, start_y + 5, fill="#fbbf24", outline="")
         canvas.create_oval(end_x - 6, end_y - 6, end_x + 6, end_y + 6, fill="#34d399", outline="")
-        canvas.create_text(12, 12, anchor="nw", fill="#cbd5e1",
-                           text=f"id:{sample.stroke_id}  pts:{sample.point_count or len(sample.points)}  seq:{sample.seq}")
+        canvas.create_text(
+            12,
+            12,
+            anchor="nw",
+            fill="#cbd5e1",
+            text=(
+                f"id:{sample.stroke_id}  pts:{sample.point_count or len(sample.points)}  "
+                f"seq:{sample.seq}  label:{sample.label or '-'}  cond:{sample.condition or '-'}"
+            ),
+        )
 
     def _render_live(self) -> None:
         self._draw_sample(self.live_canvas, self.current_stroke, "#0b0f16")
@@ -739,7 +1256,10 @@ class GraffitiCaptureGui:
                 f"delta_y: {sample.delta_y}",
                 f"saved: {sample.saved}",
                 f"label: {sample.label or '-'}",
+                f"condition: {sample.condition or '-'}",
+                f"capture_uid: {sample.capture_uid or '-'}",
                 f"script_target: {self.script_target_var.get()}",
+                f"script_condition: {self.script_condition_var.get()}",
                 f"script_progress: {self.script_progress_var.get()}",
             ]
             self.meta_text.insert("1.0", "\n".join(lines))
@@ -747,14 +1267,13 @@ class GraffitiCaptureGui:
 
     def close(self) -> None:
         try:
-            self.send_command("trace off")
+            self.send_command("trace off", user_visible=False)
         except Exception:
             pass
-        self.reader.stop()
-        try:
-            self.serial.close()
-        except Exception:
-            pass
+        if self._connect_retry_after_id is not None:
+            self.root.after_cancel(self._connect_retry_after_id)
+            self._connect_retry_after_id = None
+        self._disconnect_serial()
         self.root.destroy()
 
 

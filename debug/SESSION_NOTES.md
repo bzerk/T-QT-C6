@@ -187,3 +187,45 @@
     - 32 normalized XY points
     - 32 normalized delta XY vectors
     - label + scripted session metadata + path length + bounding box
+
+## 2026-03-13: Collector reliability + conditioned trainer
+- `tools/graffiti_capture_gui.py` collector flow tightened up:
+  - custom target parsing now correctly expands compact mixed sequences such as `abcdefghijklmnopqrstuvwxyz SPACE BKSP . , ... 0123456789`
+  - scripted capture supports conditions via prompt presets:
+    - `letters`
+    - `punct`
+    - `numeric`
+    - `all`
+  - startup/script begin now waits for real firmware acknowledgements instead of treating any serial text as "ready"
+  - readiness is based on CDC replies for:
+    - `mode graffiti`
+    - `trace cont`
+    - `status`
+  - boot timing was stretched because opening the CDC port resets the board and firmware boot takes materially longer than the original 900 ms timeout
+  - startup behavior now:
+    - open serial
+    - wait for boot settle
+    - configure graffiti mode + continuous trace
+    - only then enable capture controls / scripted run callbacks
+  - `Undo Last` remains in place and rewinds all three dataset outputs:
+    - raw JSONL
+    - TinyML JSONL
+    - TinyML CSV
+  - TinyML CSV schema guard now backs up mismatched older CSV files before rewriting a new header
+- New host-side conditioned trainer from the training worker:
+  - `tools/train_graffiti_model.py`
+  - `docs/GRAFFITI_MODEL_TRAINING.md`
+- Trainer behavior:
+  - single conditioned classifier label space:
+    - lowercase `a-z`
+    - punctuation/control `SPACE BKSP . , ( ) - _ # * ? '`
+    - numerics `0-9`
+  - condition input:
+    - `letters`
+    - `punct`
+    - `numeric`
+  - prefers TensorFlow/Keras + TFLite export when available
+  - otherwise falls back to prototype baseline export
+- Current host Python environment still lacks ML packages (`tensorflow`, `numpy`, `scikit-learn`, etc.), so fallback backend is the only path unless that stack is installed later.
+- Relaunched updated collector GUI via Terminal after these changes:
+  - `python3 tools/graffiti_capture_gui.py --port /dev/cu.usbmodem101 --output debug/graffiti_capture/samples.jsonl`
