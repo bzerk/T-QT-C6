@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
 import math
+import os
 import queue
 import re
 import shutil
+import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -130,12 +134,51 @@ class SerialReader(threading.Thread):
         self._alive = False
 
 
-def autodetect_port() -> Optional[str]:
+class SingleInstanceLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(f"{os.getpid()}\n")
+        self.handle.flush()
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+        self.handle = None
+
+
+def preferred_serial_ports() -> list[str]:
     ports = [p.device for p in serial.tools.list_ports.comports()]
-    usbmodem = [p for p in ports if "usbmodem" in p]
-    if usbmodem:
-        return sorted(usbmodem)[0]
-    return sorted(ports)[0] if ports else None
+    preferred = [
+        port
+        for port in ports
+        if any(token in port for token in ("usbmodem", "usbserial", "ttyACM", "wchusbserial"))
+    ]
+    return sorted(dict.fromkeys(preferred))
+
+
+def autodetect_port() -> Optional[str]:
+    preferred = preferred_serial_ports()
+    return preferred[0] if preferred else None
 
 
 def normalize_target_token(token: str) -> str:
@@ -315,7 +358,14 @@ def derive_feature_payload(sample: StrokeSample, sample_count: int = 32) -> dict
 
 
 class GraffitiCaptureGui:
-    def __init__(self, root: tk.Tk, port_name: str, baud: int, output_path: Path):
+    def __init__(
+        self,
+        root: tk.Tk,
+        port_name: str,
+        baud: int,
+        output_path: Path,
+        instance_lock: Optional[SingleInstanceLock] = None,
+    ):
         self.root = root
         self.port_name = port_name
         self.baud = baud
@@ -323,6 +373,9 @@ class GraffitiCaptureGui:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.tinyml_jsonl_path = self.output_path.parent / "tinyml_dataset.jsonl"
         self.tinyml_csv_path = self.output_path.parent / "tinyml_dataset.csv"
+        self.log_path = self.output_path.parent / "gui.log"
+        self.log_file = self.log_path.open("a", encoding="utf-8", buffering=1)
+        self.instance_lock = instance_lock
 
         self.serial: Optional[serial.Serial] = None
         self.reader: Optional[SerialReader] = None
@@ -366,7 +419,9 @@ class GraffitiCaptureGui:
         self._boot_recover_after_id: Optional[str] = None
         self._boot_recover_generation = 0
         self._deferred_config_after_id: Optional[str] = None
+        self._boot_event_active = False
 
+        self.root.report_callback_exception = self._report_callback_exception
         self._build_ui()
         self._refresh_script_status()
         self._bind_keys()
@@ -375,6 +430,7 @@ class GraffitiCaptureGui:
         self._attempt_connect()
         self.root.after(30, self._poll_events)
         self.root.after(100, self._tick)
+        self._debug_log(f"app start pid={os.getpid()} port={self.port_name} baud={self.baud}")
 
     def _build_ui(self) -> None:
         self.root.title("Ringo Graffiti Capture")
@@ -525,8 +581,24 @@ class GraffitiCaptureGui:
             self.label_entry.focus_set()
             self.label_entry.icursor("end")
 
+    def _debug_log(self, message: str) -> None:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.log_file.write(f"{stamp} {message}\n")
+        except Exception:
+            pass
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        trace = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        self._debug_log("Tk callback exception:\n" + trace)
+        try:
+            self.log(f"callback exception: {exc_value}")
+        except Exception:
+            pass
+
     def log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
+        self._debug_log(message)
         self.log_text.configure(state="normal")
         self.log_text.insert("1.0", f"{stamp} {message}\n")
         self.log_text.configure(state="disabled")
@@ -675,6 +747,7 @@ class GraffitiCaptureGui:
         self._configure_status_ack = False
         self.current_stroke = None
         self._render_live()
+        self._boot_event_active = False
         self._set_device_ready(False, "Disconnected; retrying...")
 
     def _schedule_delayed_configure(self, delay_ms: int, reason: str, force: bool = True, on_ready=None) -> None:
@@ -751,6 +824,10 @@ class GraffitiCaptureGui:
     def _handle_device_boot(self, source: str) -> None:
         if self._closing:
             return
+        if self._boot_event_active:
+            self._debug_log(f"boot event already active; ignored duplicate signal from {source}")
+            return
+        self._boot_event_active = True
         self._boot_recover_generation += 1
         generation = self._boot_recover_generation
         if self._deferred_config_after_id is not None:
@@ -790,6 +867,7 @@ class GraffitiCaptureGui:
             if not (self._configure_mode_ack and self._configure_trace_ack and self._configure_status_ack):
                 return
             self._configure_pending = False
+        self._boot_event_active = False
         if not self.device_ready:
             self._set_device_ready(True, f"Ready ({source})")
             self.log(f"device ready via {source}")
@@ -1350,7 +1428,10 @@ class GraffitiCaptureGui:
         self.meta_text.configure(state="disabled")
 
     def close(self) -> None:
+        if self._closing:
+            return
         self._closing = True
+        self._debug_log("close requested")
         try:
             self.send_command("trace off", user_visible=False)
         except Exception:
@@ -1361,7 +1442,17 @@ class GraffitiCaptureGui:
         if self._connect_retry_after_id is not None:
             self.root.after_cancel(self._connect_retry_after_id)
             self._connect_retry_after_id = None
+        if self._deferred_config_after_id is not None:
+            self.root.after_cancel(self._deferred_config_after_id)
+            self._deferred_config_after_id = None
         self._disconnect_serial()
+        if self.instance_lock is not None:
+            self.instance_lock.release()
+            self.instance_lock = None
+        try:
+            self.log_file.close()
+        except Exception:
+            pass
         self.root.destroy()
 
 
@@ -1383,13 +1474,26 @@ def main() -> int:
     if not args.port:
         print("No serial port found.")
         return 1
+    instance_lock = SingleInstanceLock(Path("debug/graffiti_capture/gui.lock"))
+    if not instance_lock.acquire():
+        print("Another graffiti_capture_gui.py instance is already running. See debug/graffiti_capture/gui.log")
+        return 2
     root = tk.Tk()
-    app = GraffitiCaptureGui(root, args.port, args.baud, args.output)
+    app = GraffitiCaptureGui(root, args.port, args.baud, args.output, instance_lock=instance_lock)
     app._render_live()
     app._render_last()
     app._render_meta()
-    root.mainloop()
-    return 0
+    try:
+        root.mainloop()
+        return 0
+    except Exception:
+        trace = traceback.format_exc()
+        app._debug_log("fatal exception:\n" + trace)
+        raise
+    finally:
+        if app.instance_lock is not None:
+            app.instance_lock.release()
+            app.instance_lock = None
 
 
 if __name__ == "__main__":
