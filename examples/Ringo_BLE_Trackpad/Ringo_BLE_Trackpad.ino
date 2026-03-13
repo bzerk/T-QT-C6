@@ -50,6 +50,7 @@ constexpr uint32_t kGraffitiIdleTouchPollMs = 40;
 constexpr uint32_t kGraffitiReleaseHoldMs = 180;
 constexpr int16_t kCstIdleX = 60;
 constexpr int16_t kCstIdleY = 150;
+constexpr uint8_t kGraffitiCaptureLabelMaxLen = 16;
 constexpr bool kTouchGestureYInverted = true;
 constexpr uint8_t kSerialCmdMaxLen = 64;
 constexpr uint32_t kSerialBootWaitMs = 250;
@@ -163,6 +164,7 @@ int16_t g_touchDownY = -1;
 bool g_swipeHandledThisTouch = false;
 GraffitiEngine g_graffitiEngine;
 GraffitiEngine::Point g_graffitiStroke[kGraffitiStrokeMaxPoints];
+uint16_t g_graffitiStrokeTimeMs[kGraffitiStrokeMaxPoints] = {0};
 uint16_t g_graffitiStrokeCount = 0;
 uint16_t g_graffitiLastStrokePoints = 0;
 uint32_t g_graffitiTouchStartMs = 0;
@@ -183,6 +185,9 @@ int16_t g_graffitiLastDeltaY = 0;
 uint16_t g_graffitiLastPressMs = 0;
 bool g_graffitiReadFault = false;
 bool g_graffitiTapOnlyActive = false;
+bool g_captureNextStrokeArmed = false;
+char g_captureNextLabel[kGraffitiCaptureLabelMaxLen] = {0};
+uint32_t g_captureStrokeId = 0;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -736,6 +741,32 @@ String textTail(const String &text, uint8_t maxLen) {
   return text.substring(text.length() - maxLen);
 }
 
+bool isValidCaptureLabel(const String &label) {
+  if (label.isEmpty() || label.length() >= kGraffitiCaptureLabelMaxLen) {
+    return false;
+  }
+  for (uint16_t i = 0; i < label.length(); ++i) {
+    const char c = label.charAt(i);
+    if (!isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+void disarmGraffitiCapture() {
+  g_captureNextStrokeArmed = false;
+  g_captureNextLabel[0] = '\0';
+}
+
+void armGraffitiCapture(const String &label) {
+  const size_t copyLen = std::min(static_cast<size_t>(label.length()),
+                                  static_cast<size_t>(kGraffitiCaptureLabelMaxLen - 1));
+  memcpy(g_captureNextLabel, label.c_str(), copyLen);
+  g_captureNextLabel[copyLen] = '\0';
+  g_captureNextStrokeArmed = true;
+}
+
 String normalizeTouchGesture(const String &rawGesture) {
   if (!kTouchGestureYInverted) {
     return rawGesture;
@@ -935,7 +966,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|cap?|cap off|cap <label>|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -979,6 +1010,8 @@ void processSerialCommand(const char *line) {
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
                   g_graffitiEngine.lastTokenSequence());
+    Serial.printf("[cmd] capture=%s label=%s\n", g_captureNextStrokeArmed ? "armed" : "off",
+                  g_captureNextStrokeArmed ? g_captureNextLabel : "-");
     return;
   }
   if (cmd == "cal" || cmd == "calibrate" || cmd == "imu cal" || cmd == "bias cal") {
@@ -1030,6 +1063,34 @@ void processSerialCommand(const char *line) {
   if (cmd == "recog reset") {
     g_graffitiEngine.resetStats();
     setCommandAck("ok recog reset");
+    return;
+  }
+  if (cmd == "cap" || cmd == "cap?" || cmd == "capture" || cmd == "capture?") {
+    setCommandAck(String("capture=") + (g_captureNextStrokeArmed ? "armed" : "off"));
+    Serial.printf("[cmd] capture=%s label=%s\n", g_captureNextStrokeArmed ? "armed" : "off",
+                  g_captureNextStrokeArmed ? g_captureNextLabel : "-");
+    return;
+  }
+  if (cmd == "cap off" || cmd == "capture off") {
+    disarmGraffitiCapture();
+    setCommandAck("ok capture off");
+    return;
+  }
+  if (cmd.startsWith("cap ") || cmd.startsWith("capture ")) {
+    const uint16_t prefixLen = cmd.startsWith("capture ") ? 8 : 4;
+    String arg = cmd.substring(prefixLen);
+    arg.trim();
+    if (arg == "off") {
+      disarmGraffitiCapture();
+      setCommandAck("ok capture off");
+      return;
+    }
+    if (!isValidCaptureLabel(arg)) {
+      setCommandAck("err cap label");
+      return;
+    }
+    armGraffitiCapture(arg);
+    setCommandAck(String("ok cap=") + arg);
     return;
   }
   if (cmd == "shift") {
@@ -1121,7 +1182,44 @@ bool applyGraffitiSymbol(char symbol) {
   return sendKeyboardSymbol(symbol);
 }
 
-void graffitiAddPoint(int16_t x, int16_t y) {
+void emitGraffitiCapture(const char *status, const GraffitiEngine::Result *result) {
+  if (!g_captureNextStrokeArmed) {
+    return;
+  }
+
+  ++g_captureStrokeId;
+  String predicted = "-";
+  float confidence = 0.0f;
+  float distance = 0.0f;
+  bool accepted = false;
+  uint8_t tokenCount = 0;
+  const char *backend = "NONE";
+  const char *seq = g_graffitiEngine.lastTokenSequence();
+  if (result != nullptr) {
+    predicted = graffitiSymbolLabel(result->symbol);
+    confidence = result->confidence;
+    distance = result->rawDistance;
+    accepted = result->accepted;
+    tokenCount = result->tokenCount;
+    backend = graffitiEngineLabel(result->backend);
+  }
+
+  Serial.printf("[cap] id=%lu label=%s status=%s pred=%s accepted=%u score=%.2f dist=%.2f backend=%s tok=%u seq=%s points=%u dur=%u dx=%d dy=%d pts=",
+                static_cast<unsigned long>(g_captureStrokeId), g_captureNextLabel, status,
+                predicted.c_str(), accepted ? 1U : 0U, confidence, distance, backend,
+                static_cast<unsigned>(tokenCount), seq, static_cast<unsigned>(g_graffitiStrokeCount),
+                static_cast<unsigned>(g_graffitiLastPressMs), g_graffitiLastDeltaX, g_graffitiLastDeltaY);
+  for (uint16_t i = 0; i < g_graffitiStrokeCount; ++i) {
+    Serial.printf("%s[%d,%d,%u]", (i == 0) ? "" : ",",
+                  static_cast<int>(g_graffitiStroke[i].x),
+                  static_cast<int>(g_graffitiStroke[i].y),
+                  static_cast<unsigned>(g_graffitiStrokeTimeMs[i]));
+  }
+  Serial.println();
+  disarmGraffitiCapture();
+}
+
+void graffitiAddPoint(int16_t x, int16_t y, uint32_t now) {
   if (g_graffitiStrokeCount > 0) {
     const float dx = static_cast<float>(x) - g_graffitiStroke[g_graffitiStrokeCount - 1].x;
     const float dy = static_cast<float>(y) - g_graffitiStroke[g_graffitiStrokeCount - 1].y;
@@ -1137,6 +1235,9 @@ void graffitiAddPoint(int16_t x, int16_t y) {
 
   g_graffitiStroke[g_graffitiStrokeCount].x = static_cast<float>(x);
   g_graffitiStroke[g_graffitiStrokeCount].y = static_cast<float>(y);
+  g_graffitiStrokeTimeMs[g_graffitiStrokeCount] =
+      (g_graffitiTouchStartMs == 0) ? 0
+                                    : static_cast<uint16_t>(std::min<uint32_t>(65535, now - g_graffitiTouchStartMs));
   g_graffitiStrokeCount++;
 }
 
@@ -1152,6 +1253,7 @@ void finalizeGraffitiStroke() {
     g_graffitiStatus = "SHORT";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
+    emitGraffitiCapture("SHORT", nullptr);
     resetGraffitiTapSwitchState();
     resetGraffitiStrokeState();
     return;
@@ -1162,6 +1264,7 @@ void finalizeGraffitiStroke() {
     g_graffitiStatus = "ERROR";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
+    emitGraffitiCapture("ERROR", nullptr);
     resetGraffitiTapSwitchState();
     resetGraffitiStrokeState();
     return;
@@ -1185,6 +1288,7 @@ void finalizeGraffitiStroke() {
                   g_graffitiEngine.lastTokenSequence());
   }
 
+  emitGraffitiCapture(g_graffitiStatus.c_str(), &result);
   resetGraffitiTapSwitchState();
   resetGraffitiStrokeState();
 }
@@ -1343,7 +1447,7 @@ void sampleGraffitiTouchState() {
     }
 
     if (coordTouch) {
-      graffitiAddPoint(g_touchX, g_touchY);
+      graffitiAddPoint(g_touchX, g_touchY, now);
     }
     if ((now - g_graffitiTouchStartMs) > kGraffitiStrokeMaxDurationMs) {
       g_touchDown = false;
