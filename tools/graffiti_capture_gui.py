@@ -30,6 +30,7 @@ TRACE_END_RE = re.compile(
 CMD_MODE_RE = re.compile(r"^\[cmd\] mode=([A-Z]+)")
 CMD_TRACE_RE = re.compile(r"^\[cmd\] trace=([^ ]+)")
 MODE_SWITCH_RE = re.compile(r"^\[mode\] switched to ([A-Z]+)")
+BOOT_BANNER_RE = re.compile(r"^\[boot\] Ringo BLE trackpad starting$")
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
 PUNCT_LABELS = ["SPACE", "BKSP", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
@@ -362,6 +363,9 @@ class GraffitiCaptureGui:
         self._last_error_message = ""
         self.device_action_widgets: list[tk.Widget] = []
         self._closing = False
+        self._boot_recover_after_id: Optional[str] = None
+        self._boot_recover_generation = 0
+        self._deferred_config_after_id: Optional[str] = None
 
         self._build_ui()
         self._refresh_script_status()
@@ -631,7 +635,7 @@ class GraffitiCaptureGui:
             self._last_error_message = ""
             self.log(f"opened {self.port_name} @ {self.baud}")
             self._set_device_ready(False, "Connected; waiting for boot...")
-            self.root.after(2500, lambda: self._configure_device(reason="startup", force=True))
+            self._schedule_delayed_configure(2500, reason="startup", force=True)
         except Exception as exc:  # pragma: no cover - hardware dependent
             self.serial = None
             self.reader = None
@@ -653,6 +657,9 @@ class GraffitiCaptureGui:
             self._attempt_connect()
 
     def _disconnect_serial(self) -> None:
+        if self._deferred_config_after_id is not None:
+            self.root.after_cancel(self._deferred_config_after_id)
+            self._deferred_config_after_id = None
         if self.reader is not None:
             self.reader.stop()
             self.reader = None
@@ -666,7 +673,23 @@ class GraffitiCaptureGui:
         self._configure_mode_ack = False
         self._configure_trace_ack = False
         self._configure_status_ack = False
+        self.current_stroke = None
+        self._render_live()
         self._set_device_ready(False, "Disconnected; retrying...")
+
+    def _schedule_delayed_configure(self, delay_ms: int, reason: str, force: bool = True, on_ready=None) -> None:
+        if on_ready is not None:
+            self._ready_callbacks.append(on_ready)
+        if self._deferred_config_after_id is not None:
+            self.root.after_cancel(self._deferred_config_after_id)
+        self._deferred_config_after_id = self.root.after(
+            delay_ms,
+            lambda: self._run_deferred_configure(reason, force),
+        )
+
+    def _run_deferred_configure(self, reason: str, force: bool) -> None:
+        self._deferred_config_after_id = None
+        self._configure_device(reason=reason, force=force)
 
     def _configure_device(self, reason: str = "startup", force: bool = False, on_ready=None) -> None:
         if on_ready is not None:
@@ -708,6 +731,59 @@ class GraffitiCaptureGui:
                 callback()
             except Exception as exc:
                 self.log(f"ready callback failed: {exc}")
+
+    def _resume_after_recovery(self) -> None:
+        if not self.script_state.active:
+            self.log("device recovered")
+            return
+        current = self.script_state.current_target()
+        if current is None:
+            self.log("device recovered")
+            return
+        self.label_var.set(current.label)
+        self.autosave_var.set(True)
+        self._refresh_script_status()
+        self.log(
+            f"device recovered; resuming {current.label} ({current.condition}) "
+            f"rep {self.script_state.rep_index + 1}/{self.script_state.reps_per_target}"
+        )
+
+    def _handle_device_boot(self, source: str) -> None:
+        if self._closing:
+            return
+        self._boot_recover_generation += 1
+        generation = self._boot_recover_generation
+        if self._deferred_config_after_id is not None:
+            self.root.after_cancel(self._deferred_config_after_id)
+            self._deferred_config_after_id = None
+        if self._boot_recover_after_id is not None:
+            self.root.after_cancel(self._boot_recover_after_id)
+            self._boot_recover_after_id = None
+        self.current_stroke = None
+        self._render_live()
+        self._configure_pending = False
+        self._configure_mode_ack = False
+        self._configure_trace_ack = False
+        self._configure_status_ack = False
+        self._set_device_ready(False, f"Device reboot detected ({source}); recovering...")
+        if self.script_state.active:
+            current = self.script_state.current_target()
+            if current is not None:
+                self.script_detail_var.set(
+                    f"Recovering session {self.script_state.session_id} at "
+                    f"{current.label} {self.script_state.rep_index + 1}/{self.script_state.reps_per_target}"
+                )
+        self.log(f"device reboot detected via {source}; waiting for boot")
+        self._boot_recover_after_id = self.root.after(2500, lambda: self._run_boot_recovery(generation))
+
+    def _run_boot_recovery(self, generation: int) -> None:
+        if generation != self._boot_recover_generation or self._closing:
+            return
+        self._boot_recover_after_id = None
+        if self.serial is None:
+            self._schedule_reconnect()
+            return
+        self._configure_device(reason="recovery", force=True, on_ready=self._resume_after_recovery)
 
     def _mark_device_ready(self, source: str = "device") -> None:
         if self._configure_pending:
@@ -1076,6 +1152,14 @@ class GraffitiCaptureGui:
     def process_line(self, line: str) -> None:
         if not line:
             return
+        if BOOT_BANNER_RE.match(line):
+            self.log(line)
+            self._handle_device_boot("boot banner")
+            return
+        if line.startswith("ESP-ROM:") or line.startswith("rst:") or line.startswith("entry "):
+            self.log(line)
+            self._handle_device_boot("rom boot")
+            return
         mode_match = CMD_MODE_RE.match(line)
         if mode_match:
             self._last_mode_value = mode_match.group(1).lower()
@@ -1266,10 +1350,14 @@ class GraffitiCaptureGui:
         self.meta_text.configure(state="disabled")
 
     def close(self) -> None:
+        self._closing = True
         try:
             self.send_command("trace off", user_visible=False)
         except Exception:
             pass
+        if self._boot_recover_after_id is not None:
+            self.root.after_cancel(self._boot_recover_after_id)
+            self._boot_recover_after_id = None
         if self._connect_retry_after_id is not None:
             self.root.after_cancel(self._connect_retry_after_id)
             self._connect_retry_after_id = None

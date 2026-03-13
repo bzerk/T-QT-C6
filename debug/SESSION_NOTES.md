@@ -229,3 +229,8 @@
 - Current host Python environment still lacks ML packages (`tensorflow`, `numpy`, `scikit-learn`, etc.), so fallback backend is the only path unless that stack is installed later.
 - Relaunched updated collector GUI via Terminal after these changes:
   - `python3 tools/graffiti_capture_gui.py --port /dev/cu.usbmodem101 --output debug/graffiti_capture/samples.jsonl`
+- Added collector-side reboot recovery in `tools/graffiti_capture_gui.py`:
+  - detects ESP32 ROM/boot banners on the open CDC stream
+  - treats mid-session reboot as a recovery event instead of random log noise
+  - clears the in-flight unsaved stroke, waits for boot, reconfigures `mode graffiti` + `trace cont`, and resumes the active scripted target/rep
+  - avoids duplicate startup/recovery configure timers by using a single deferred-config path
