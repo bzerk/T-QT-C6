@@ -105,6 +105,12 @@ enum class InputMode : uint8_t {
   Graffiti,
 };
 
+enum class GraffitiTraceMode : uint8_t {
+  Off,
+  Once,
+  Continuous,
+};
+
 volatile bool g_touchInterrupt = false;
 bool g_bleConnected = false;
 bool g_touchActive = false;
@@ -188,6 +194,9 @@ bool g_graffitiTapOnlyActive = false;
 bool g_captureNextStrokeArmed = false;
 char g_captureNextLabel[kGraffitiCaptureLabelMaxLen] = {0};
 uint32_t g_captureStrokeId = 0;
+GraffitiTraceMode g_graffitiTraceMode = GraffitiTraceMode::Off;
+uint32_t g_graffitiTraceStrokeId = 0;
+uint32_t g_activeGraffitiTraceStrokeId = 0;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -212,6 +221,9 @@ bool saveUiConfigToNvs();
 void resetStationaryBiasEstimator();
 void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps);
 bool recalibrateGyroBias(bool persistBias);
+void setCommandAck(const String &ack);
+String graffitiSymbolLabel(char symbol);
+const char *graffitiEngineLabel(GraffitiEngine::Backend engine);
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -695,6 +707,17 @@ const char *modeName(InputMode mode) {
   return (mode == InputMode::Graffiti) ? "GRAFFITI" : "MOUSE";
 }
 
+const char *graffitiTraceModeName(GraffitiTraceMode mode) {
+  switch (mode) {
+    case GraffitiTraceMode::Once:
+      return "capture";
+    case GraffitiTraceMode::Continuous:
+      return "continuous";
+    default:
+      return "stop";
+  }
+}
+
 const char *resetReasonName(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_UNKNOWN:
@@ -767,6 +790,69 @@ void armGraffitiCapture(const String &label) {
   g_captureNextStrokeArmed = true;
 }
 
+bool graffitiTraceActive() {
+  return g_graffitiTraceMode != GraffitiTraceMode::Off;
+}
+
+void setGraffitiTraceMode(GraffitiTraceMode mode) {
+  g_graffitiTraceMode = mode;
+  g_activeGraffitiTraceStrokeId = 0;
+}
+
+void beginGraffitiTraceStroke() {
+  if (!graffitiTraceActive()) {
+    return;
+  }
+  ++g_graffitiTraceStrokeId;
+  g_activeGraffitiTraceStrokeId = g_graffitiTraceStrokeId;
+  Serial.printf("[trace] begin id=%lu mode=%s\n",
+                static_cast<unsigned long>(g_activeGraffitiTraceStrokeId),
+                graffitiTraceModeName(g_graffitiTraceMode));
+}
+
+void emitGraffitiTracePoint(int16_t x, int16_t y, uint16_t t_ms) {
+  if (!graffitiTraceActive() || g_activeGraffitiTraceStrokeId == 0) {
+    return;
+  }
+  Serial.printf("[trace] point id=%lu x=%d y=%d t=%u\n",
+                static_cast<unsigned long>(g_activeGraffitiTraceStrokeId),
+                static_cast<int>(x), static_cast<int>(y), static_cast<unsigned>(t_ms));
+}
+
+void endGraffitiTraceStroke(const char *status, const GraffitiEngine::Result *result) {
+  if (!graffitiTraceActive() || g_activeGraffitiTraceStrokeId == 0) {
+    return;
+  }
+
+  String predicted = "-";
+  float confidence = 0.0f;
+  float distance = 0.0f;
+  bool accepted = false;
+  uint8_t tokenCount = 0;
+  const char *backend = "NONE";
+  const char *seq = g_graffitiEngine.lastTokenSequence();
+  if (result != nullptr) {
+    predicted = graffitiSymbolLabel(result->symbol);
+    confidence = result->confidence;
+    distance = result->rawDistance;
+    accepted = result->accepted;
+    tokenCount = result->tokenCount;
+    backend = graffitiEngineLabel(result->backend);
+  }
+
+  Serial.printf("[trace] end id=%lu status=%s pred=%s accepted=%u score=%.2f dist=%.2f backend=%s tok=%u seq=%s points=%u dur=%u dx=%d dy=%d\n",
+                static_cast<unsigned long>(g_activeGraffitiTraceStrokeId), status,
+                predicted.c_str(), accepted ? 1U : 0U, confidence, distance, backend,
+                static_cast<unsigned>(tokenCount), seq, static_cast<unsigned>(g_graffitiStrokeCount),
+                static_cast<unsigned>(g_graffitiLastPressMs), g_graffitiLastDeltaX, g_graffitiLastDeltaY);
+
+  g_activeGraffitiTraceStrokeId = 0;
+  if (g_graffitiTraceMode == GraffitiTraceMode::Once) {
+    g_graffitiTraceMode = GraffitiTraceMode::Off;
+    setCommandAck("trace=stop");
+  }
+}
+
 String normalizeTouchGesture(const String &rawGesture) {
   if (!kTouchGestureYInverted) {
     return rawGesture;
@@ -789,6 +875,7 @@ void resetGraffitiStrokeState() {
   g_graffitiLastDeltaY = 0;
   g_graffitiLastPressMs = 0;
   g_graffitiReadFault = false;
+  g_activeGraffitiTraceStrokeId = 0;
 }
 
 void resetGraffitiTapSwitchState() {
@@ -966,7 +1053,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|cap?|cap off|cap <label>|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog trie|recog hybrid|recog reset|trace?|trace off|trace once|trace cont|cap?|cap off|cap <label>|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -1010,6 +1097,8 @@ void processSerialCommand(const char *line) {
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
                   g_graffitiEngine.lastTokenSequence());
+    Serial.printf("[cmd] trace=%s active_id=%lu\n", graffitiTraceModeName(g_graffitiTraceMode),
+                  static_cast<unsigned long>(g_activeGraffitiTraceStrokeId));
     Serial.printf("[cmd] capture=%s label=%s\n", g_captureNextStrokeArmed ? "armed" : "off",
                   g_captureNextStrokeArmed ? g_captureNextLabel : "-");
     return;
@@ -1063,6 +1152,28 @@ void processSerialCommand(const char *line) {
   if (cmd == "recog reset") {
     g_graffitiEngine.resetStats();
     setCommandAck("ok recog reset");
+    return;
+  }
+  if (cmd == "trace" || cmd == "trace?" || cmd == "stream" || cmd == "stream?") {
+    setCommandAck(String("trace=") + graffitiTraceModeName(g_graffitiTraceMode));
+    Serial.printf("[cmd] trace=%s active_id=%lu\n", graffitiTraceModeName(g_graffitiTraceMode),
+                  static_cast<unsigned long>(g_activeGraffitiTraceStrokeId));
+    return;
+  }
+  if (cmd == "trace off" || cmd == "stream off" || cmd == "stop") {
+    setGraffitiTraceMode(GraffitiTraceMode::Off);
+    setCommandAck("trace=stop");
+    return;
+  }
+  if (cmd == "trace once" || cmd == "stream once" || cmd == "capture once") {
+    setGraffitiTraceMode(GraffitiTraceMode::Once);
+    setCommandAck("trace=capture");
+    return;
+  }
+  if (cmd == "trace cont" || cmd == "trace continuous" || cmd == "stream cont" ||
+      cmd == "stream continuous" || cmd == "continuous") {
+    setGraffitiTraceMode(GraffitiTraceMode::Continuous);
+    setCommandAck("trace=continuous");
     return;
   }
   if (cmd == "cap" || cmd == "cap?" || cmd == "capture" || cmd == "capture?") {
@@ -1238,6 +1349,7 @@ void graffitiAddPoint(int16_t x, int16_t y, uint32_t now) {
   g_graffitiStrokeTimeMs[g_graffitiStrokeCount] =
       (g_graffitiTouchStartMs == 0) ? 0
                                     : static_cast<uint16_t>(std::min<uint32_t>(65535, now - g_graffitiTouchStartMs));
+  emitGraffitiTracePoint(x, y, g_graffitiStrokeTimeMs[g_graffitiStrokeCount]);
   g_graffitiStrokeCount++;
 }
 
@@ -1253,6 +1365,7 @@ void finalizeGraffitiStroke() {
     g_graffitiStatus = "SHORT";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
+    endGraffitiTraceStroke("SHORT", nullptr);
     emitGraffitiCapture("SHORT", nullptr);
     resetGraffitiTapSwitchState();
     resetGraffitiStrokeState();
@@ -1264,6 +1377,7 @@ void finalizeGraffitiStroke() {
     g_graffitiStatus = "ERROR";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
+    endGraffitiTraceStroke("ERROR", nullptr);
     emitGraffitiCapture("ERROR", nullptr);
     resetGraffitiTapSwitchState();
     resetGraffitiStrokeState();
@@ -1288,6 +1402,7 @@ void finalizeGraffitiStroke() {
                   g_graffitiEngine.lastTokenSequence());
   }
 
+  endGraffitiTraceStroke(g_graffitiStatus.c_str(), &result);
   emitGraffitiCapture(g_graffitiStatus.c_str(), &result);
   resetGraffitiTapSwitchState();
   resetGraffitiStrokeState();
@@ -1409,6 +1524,7 @@ void sampleGraffitiTouchState() {
       g_touchDown = false;
       g_touchActive = false;
       g_graffitiStatus = "T-ERR";
+      endGraffitiTraceStroke("T-ERR", nullptr);
       resetGraffitiTapSwitchState();
       resetGraffitiStrokeState();
     }
@@ -1444,6 +1560,7 @@ void sampleGraffitiTouchState() {
       g_touchDownX = g_touchX;
       g_touchDownY = g_touchY;
       g_graffitiLastCoordMs = now;
+      beginGraffitiTraceStroke();
     }
 
     if (coordTouch) {
