@@ -18,6 +18,7 @@ PUNCT_LABELS = [
     "SPACE",
     "BKSP",
     "RET",
+    "ESC",
     ".",
     ",",
     "(",
@@ -754,7 +755,11 @@ def export_prototype_cpp(model: dict, output_dir: Path) -> None:
     vector_counter = 0
     for label in labels:
         condition_index = CONDITIONS.index(LABEL_TO_CONDITION[label])
-        symbol = "\n" if label == "RET" else ("\b" if label == "BKSP" else (" " if label == "SPACE" else label))
+        symbol = (
+            "\x1b"
+            if label == "ESC"
+            else ("\n" if label == "RET" else ("\b" if label == "BKSP" else (" " if label == "SPACE" else label)))
+        )
         symbol_literal = cpp_char_literal(symbol)
         for _centroid in prototypes.get(label, []):
             lines.append(

@@ -513,6 +513,9 @@ bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
     case '\r':
       usage = 0x28;
       return true;
+    case 0x1B:
+      usage = 0x29;
+      return true;
     case '.':
       usage = 0x37;
       return true;
