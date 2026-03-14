@@ -14,7 +14,27 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
-PUNCT_LABELS = ["SPACE", "BKSP", "RET", ".", ",", "(", ")", "-", "_", "#", "*", "?", "'"]
+PUNCT_LABELS = [
+    "SPACE",
+    "BKSP",
+    "RET",
+    ".",
+    ",",
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    "<",
+    ">",
+    "-",
+    "_",
+    "#",
+    "*",
+    "?",
+    "'",
+]
 NUMERIC_LABELS = list("0123456789")
 EXPECTED_LABELS = LETTER_LABELS + PUNCT_LABELS + NUMERIC_LABELS
 CONDITIONS = ["letters", "punct", "numeric"]

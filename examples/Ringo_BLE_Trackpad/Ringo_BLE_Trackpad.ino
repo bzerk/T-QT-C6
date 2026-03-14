@@ -549,6 +549,28 @@ bool mapSymbolToKeyboardUsage(char symbol, uint8_t &modifier, uint8_t &usage) {
       usage = 0x27;
       modifier = 0x02;
       return true;
+    case '[':
+      usage = 0x2F;
+      return true;
+    case ']':
+      usage = 0x30;
+      return true;
+    case '{':
+      usage = 0x2F;
+      modifier = 0x02;
+      return true;
+    case '}':
+      usage = 0x30;
+      modifier = 0x02;
+      return true;
+    case '<':
+      usage = 0x36;
+      modifier = 0x02;
+      return true;
+    case '>':
+      usage = 0x37;
+      modifier = 0x02;
+      return true;
     default:
       return false;
   }
