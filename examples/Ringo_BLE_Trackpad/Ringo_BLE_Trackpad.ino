@@ -73,6 +73,7 @@ constexpr uint32_t kSerialBootWaitMs = 250;
 constexpr uint8_t kSetupShiftConnectAttempts = 4;
 constexpr uint32_t kSetupShiftInitialDelayMs = 450;
 constexpr uint32_t kSetupShiftRetryMs = 320;
+constexpr uint32_t kHidReconnectGraceMs = 900;
 
 constexpr uint16_t kImuGyroCalibrationSamples = 160;
 constexpr float kGyroDeadzoneDps = 4.0f;
@@ -104,6 +105,8 @@ constexpr char kUiCfgNvsNamespace[] = "ringo_ui";
 constexpr char kUiCfgNvsKey[] = "mouse_cfg";
 constexpr uint32_t kUiCfgRecordMagic = 0x52435549;  // "RCUI"
 constexpr uint16_t kUiCfgRecordVersion = 1;
+constexpr char kInputModeNvsNamespace[] = "ringo_mode";
+constexpr char kInputModeNvsKey[] = "input_mode";
 constexpr float kDefaultScrollGain = 0.70f;
 constexpr float kMinScrollGain = 0.10f;
 constexpr float kMaxScrollGain = 2.00f;
@@ -265,6 +268,8 @@ bool g_graffitiOneShotCtrl = false;
 bool g_ctrlPreviewActive = false;
 char g_ctrlPreviewSymbol = 0;
 GraffitiCommandPoseAction g_commandPosePendingAction = GraffitiCommandPoseAction::None;
+bool g_hidOutputArmed = false;
+uint32_t g_hidQuietUntilMs = 0;
 uint8_t g_arrowHeldUsage = 0;
 uint32_t g_arrowRepeatDueMs = 0;
 uint32_t g_arrowModeEnteredMs = 0;
@@ -294,11 +299,14 @@ bool loadGyroBiasFromNvs();
 bool saveGyroBiasToNvs();
 bool loadUiConfigFromNvs();
 bool saveUiConfigToNvs();
+bool saveInputModeToNvs(InputMode mode);
+bool loadInputModeFromNvs(InputMode &mode);
 void resetStationaryBiasEstimator();
 void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps);
 bool recalibrateGyroBias(bool persistBias);
 void setCommandAck(const String &ack);
 void toggleInputMode();
+const char *modeName(InputMode mode);
 String graffitiSymbolLabel(char symbol);
 const char *graffitiEngineLabel(GraffitiEngine::Backend engine);
 bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t deltaY, uint16_t pointCount);
@@ -308,6 +316,9 @@ const char *graffitiShiftModeName(GraffitiShiftMode mode);
 bool sendCtrlModifiedSymbol(char symbol);
 void clearCtrlPreview();
 void sampleGraffitiCtrlPreviewTouch();
+void disarmHidOutput(uint32_t quietMs, const char *reason);
+void armHidOutput(const char *reason);
+bool canEmitHidOutput();
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -369,22 +380,27 @@ class ServerCallbacks final : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     (void)server;
     g_bleConnected = true;
+    g_buttonMask = 0;
+    g_keyboardReleasePending = false;
+    g_keyboardReleaseDueMs = 0;
+    disarmHidOutput(kHidReconnectGraceMs, "BLE connect");
     Serial.println("[ble] Connected");
-    g_setupShiftPending = true;
-    g_setupShiftAttemptsRemaining = kSetupShiftConnectAttempts;
-    g_setupShiftNextMs = millis() + kSetupShiftInitialDelayMs;
-    Serial.println("[ble] setup shift queued");
+    g_setupShiftPending = false;
+    g_setupShiftAttemptsRemaining = 0;
   }
 
   void onDisconnect(BLEServer *server) override {
     (void)server;
     g_bleConnected = false;
     g_buttonMask = 0;
+    g_keyboardReleasePending = false;
+    g_keyboardReleaseDueMs = 0;
     g_leftLockActive = false;
     g_clickMode = "FREE";
     g_tapArmed = false;
     g_setupShiftPending = false;
     g_setupShiftAttemptsRemaining = 0;
+    g_hidOutputArmed = false;
     Serial.println("[ble] Disconnected, advertising");
     if (g_advertising != nullptr) {
       delay(20);
@@ -432,7 +448,7 @@ void emitScaledWheel(float wheelUnits) {
 }
 
 void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel = 0) {
-  if (!g_bleConnected || g_inputMouse == nullptr) {
+  if (!g_bleConnected || g_inputMouse == nullptr || !canEmitHidOutput()) {
     return;
   }
 
@@ -447,7 +463,7 @@ void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel = 0) {
 }
 
 void sendKeyboardReport(uint8_t modifier, uint8_t keyUsage) {
-  if (!g_bleConnected || g_inputKeyboard == nullptr) {
+  if (!g_bleConnected || g_inputKeyboard == nullptr || !canEmitHidOutput()) {
     return;
   }
 
@@ -665,6 +681,28 @@ bool sendEscKey() {
   return true;
 }
 
+bool canEmitHidOutput() {
+  if (!g_hidOutputArmed) {
+    return false;
+  }
+  return static_cast<int32_t>(millis() - g_hidQuietUntilMs) >= 0;
+}
+
+void disarmHidOutput(uint32_t quietMs, const char *reason) {
+  g_hidOutputArmed = false;
+  g_hidQuietUntilMs = millis() + quietMs;
+  if (reason != nullptr) {
+    Serial.printf("[hid] muted (%s) quiet=%lu\n", reason, static_cast<unsigned long>(quietMs));
+  }
+}
+
+void armHidOutput(const char *reason) {
+  g_hidOutputArmed = true;
+  if (reason != nullptr) {
+    Serial.printf("[hid] armed (%s)\n", reason);
+  }
+}
+
 void clearCtrlPreview() {
   g_ctrlPreviewActive = false;
   g_ctrlPreviewSymbol = 0;
@@ -810,6 +848,13 @@ void onTapReleased() {
     return;
   }
 
+  if (!g_hidOutputArmed) {
+    armHidOutput("mouse tap");
+    g_clickMode = "UNLOCK";
+    g_lastGesture = "HID ARM";
+    return;
+  }
+
   g_clickMode = "L-CLICK";
   sendLeftClick();
   armTapWindow();
@@ -934,6 +979,43 @@ bool loadUiConfigFromNvs() {
 
   g_scrollGain = clampScrollGain(record.scrollGain);
   Serial.printf("[cfg] loaded scroll_gain=%.2f\n", g_scrollGain);
+  return true;
+}
+
+bool saveInputModeToNvs(InputMode mode) {
+  Preferences prefs;
+  if (!prefs.begin(kInputModeNvsNamespace, false)) {
+    Serial.println("[mode] NVS open failed (write)");
+    return false;
+  }
+
+  const size_t written = prefs.putUChar(kInputModeNvsKey, static_cast<uint8_t>(mode));
+  prefs.end();
+  if (written != 1) {
+    Serial.println("[mode] NVS save failed");
+    return false;
+  }
+
+  return true;
+}
+
+bool loadInputModeFromNvs(InputMode &mode) {
+  Preferences prefs;
+  if (!prefs.begin(kInputModeNvsNamespace, true)) {
+    Serial.println("[mode] NVS open failed (read)");
+    return false;
+  }
+  if (!prefs.isKey(kInputModeNvsKey)) {
+    prefs.end();
+    return false;
+  }
+
+  const uint8_t stored = prefs.getUChar(kInputModeNvsKey, static_cast<uint8_t>(InputMode::Mouse));
+  prefs.end();
+
+  mode = (stored == static_cast<uint8_t>(InputMode::Graffiti))
+      ? InputMode::Graffiti
+      : InputMode::Mouse;
   return true;
 }
 
@@ -1469,6 +1551,15 @@ void setInputMode(InputMode mode) {
   }
 
   g_inputMode = mode;
+  saveInputModeToNvs(g_inputMode);
+  if (g_bleConnected) {
+    if (g_inputMode == InputMode::Graffiti) {
+      queueSetupShift(2, 120);
+    } else {
+      g_setupShiftPending = false;
+      g_setupShiftAttemptsRemaining = 0;
+    }
+  }
   Serial.printf("[mode] switched to %s\n", modeName(g_inputMode));
   renderStatus(true);
 }
@@ -2370,6 +2461,12 @@ void sampleGraffitiTouchState() {
 
   if (tapLike) {
     resetGraffitiTapSwitchState();
+    if (!g_hidOutputArmed) {
+      armHidOutput("graffiti tap");
+      g_graffitiStatus = "HID ARM";
+      resetGraffitiStrokeState();
+      return;
+    }
     if (g_graffitiOneShotPunct) {
       g_graffitiStatus = "PUNCT .";
       applyGraffitiSymbol('.');
@@ -3111,6 +3208,11 @@ void setup() {
     Serial.printf("[cfg] using default scroll_gain=%.2f\n", g_scrollGain);
   }
   initBleMouse();
+  InputMode restoredInputMode = InputMode::Mouse;
+  if (loadInputModeFromNvs(restoredInputMode) && restoredInputMode == InputMode::Graffiti) {
+    setInputMode(InputMode::Graffiti);
+  }
+  disarmHidOutput(kHidReconnectGraceMs, "boot");
   Serial.printf("[graffiti] recognizer mode=PROTOTYPE cond=%s\n",
                 g_graffitiEngine.conditionName());
 
