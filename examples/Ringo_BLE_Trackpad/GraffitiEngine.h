@@ -34,12 +34,14 @@ class GraffitiEngine {
     uint8_t tokenCount;
   };
 
-  static constexpr float kAcceptConfidence = 0.020f;
+  static constexpr float kDefaultAcceptConfidence = 0.016f;
 
   bool classify(const Point *points, uint16_t count, Result &out);
   void setCondition(Condition condition);
   Condition condition() const;
   const char *conditionName() const;
+  void setAcceptConfidence(float threshold);
+  float acceptConfidence() const;
   void setLegacyPointFallbackEnabled(bool enabled);
   bool legacyPointFallbackEnabled() const;
   uint32_t trieAcceptCount() const;
@@ -58,6 +60,7 @@ class GraffitiEngine {
   bool buildFeatureVector(const Point *points, uint16_t count, float *out) const;
 
   Condition condition_ = Condition::Letters;
+  float acceptConfidence_ = kDefaultAcceptConfidence;
   uint32_t acceptCount_ = 0;
   uint32_t rejectCount_ = 0;
   char lastSequence_[16] = "MODEL";

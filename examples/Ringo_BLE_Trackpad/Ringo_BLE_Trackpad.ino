@@ -1431,7 +1431,7 @@ void drawStatusLine(uint8_t index, int16_t y, const String &text, uint16_t color
 }
 
 void printCommandHelp() {
-  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog reset|glyph?|glyph letters|glyph punct|glyph numeric|trace?|trace off|trace once|trace cont|cap?|cap off|cap <label>|shift|ping|help");
+  Serial.println("[cmd] g|m|mode graffiti|mode mouse|mode?|status|cal|scroll?|scroll <0.10..2.00>|recog?|recog reset|recog thr|recog thr <0.005..0.050>|glyph?|glyph letters|glyph punct|glyph numeric|trace?|trace off|trace once|trace cont|cap?|cap off|cap <label>|shift|ping|help");
 }
 
 void setCommandAck(const String &ack) {
@@ -1472,10 +1472,11 @@ void processSerialCommand(const char *line) {
     const unsigned long inferAvgUs =
         (g_graffitiInferCount == 0) ? 0UL
                                     : static_cast<unsigned long>(g_graffitiInferAccumUs / g_graffitiInferCount);
-    Serial.printf("[cmd] recognizer=%s cond=%s glyph=%s shift=%s punct1x=%u accept=%lu reject=%lu lastTok=%u seq=%s infer_us=%lu avg_us=%lu max_us=%lu\n",
+    Serial.printf("[cmd] recognizer=%s cond=%s glyph=%s shift=%s punct1x=%u thr=%.3f accept=%lu reject=%lu lastTok=%u seq=%s infer_us=%lu avg_us=%lu max_us=%lu\n",
                   "PROTOTYPE", g_graffitiEngine.conditionName(),
                   graffitiGlyphModeName(g_graffitiGlyphMode), graffitiShiftModeName(g_graffitiShiftMode),
                   g_graffitiOneShotPunct ? 1U : 0U,
+                  g_graffitiEngine.acceptConfidence(),
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
@@ -1522,7 +1523,7 @@ void processSerialCommand(const char *line) {
     const unsigned long inferAvgUs =
         (g_graffitiInferCount == 0) ? 0UL
                                     : static_cast<unsigned long>(g_graffitiInferAccumUs / g_graffitiInferCount);
-    Serial.printf("[cmd] accept=%lu reject=%lu lastTok=%u seq=%s cond=%s glyph=%s shift=%s punct1x=%u infer_us=%lu avg_us=%lu max_us=%lu q=%u drop=%lu\n",
+    Serial.printf("[cmd] accept=%lu reject=%lu lastTok=%u seq=%s cond=%s glyph=%s shift=%s punct1x=%u thr=%.3f infer_us=%lu avg_us=%lu max_us=%lu q=%u drop=%lu\n",
                   static_cast<unsigned long>(g_graffitiEngine.trieAcceptCount()),
                   static_cast<unsigned long>(g_graffitiEngine.pointAcceptCount()),
                   g_graffitiEngine.lastTokenCount(),
@@ -1530,6 +1531,7 @@ void processSerialCommand(const char *line) {
                   g_graffitiEngine.conditionName(),
                   graffitiGlyphModeName(g_graffitiGlyphMode), graffitiShiftModeName(g_graffitiShiftMode),
                   g_graffitiOneShotPunct ? 1U : 0U,
+                  g_graffitiEngine.acceptConfidence(),
                   static_cast<unsigned long>(g_graffitiLastInferUs),
                   inferAvgUs,
                   static_cast<unsigned long>(g_graffitiMaxInferUs),
@@ -1544,6 +1546,23 @@ void processSerialCommand(const char *line) {
     g_graffitiInferAccumUs = 0;
     g_graffitiInferCount = 0;
     setCommandAck("ok recog=prototype");
+    return;
+  }
+  if (cmd == "recog thr" || cmd == "recog threshold" || cmd == "thr") {
+    setCommandAck(String("recog thr=") + String(g_graffitiEngine.acceptConfidence(), 3));
+    return;
+  }
+  if (cmd.startsWith("recog thr ")) {
+    String arg = cmd.substring(10);
+    arg.trim();
+    const float parsed = arg.toFloat();
+    if (!arg.length() || (parsed == 0.0f && arg != "0" && arg != "0.0")) {
+      setCommandAck("err recog thr parse");
+      return;
+    }
+    const float threshold = constrain(parsed, 0.005f, 0.050f);
+    g_graffitiEngine.setAcceptConfidence(threshold);
+    setCommandAck(String("ok recog thr=") + String(g_graffitiEngine.acceptConfidence(), 3));
     return;
   }
   if (cmd == "glyph" || cmd == "glyph?" || cmd == "cond" || cmd == "cond?") {
@@ -1902,8 +1921,10 @@ void serviceCompletedGraffitiQueue() {
       keySent = applyGraffitiSymbol(resolvedSymbol);
     }
     consumeGraffitiOneShotModes(resolvedSymbol);
-    Serial.printf("[graffiti] ACCEPT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u kbd=%s mode=%s shift=%s\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
+    Serial.printf("[graffiti] ACCEPT %s score=%.3f thr=%.3f margin=%.3f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u kbd=%s mode=%s shift=%s\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore,
+                  g_graffitiEngine.acceptConfidence(), result.rawScore,
+                  result.rawDistance,
                   graffitiEngineLabel(result.backend), result.tokenCount,
                   g_graffitiEngine.lastTokenSequence(),
                   static_cast<unsigned long>(g_graffitiLastInferUs),
@@ -1914,8 +1935,10 @@ void serviceCompletedGraffitiQueue() {
   } else {
     g_graffitiStatus = "REJECT";
     g_rejectFlashUntilMs = millis() + kRejectFlashMs;
-    Serial.printf("[graffiti] REJECT %s score=%.2f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u mode=%s shift=%s\n",
-                  g_graffitiLastMatch.c_str(), g_graffitiLastScore, result.rawDistance,
+    Serial.printf("[graffiti] REJECT %s score=%.3f thr=%.3f margin=%.3f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u mode=%s shift=%s\n",
+                  g_graffitiLastMatch.c_str(), g_graffitiLastScore,
+                  g_graffitiEngine.acceptConfidence(), result.rawScore,
+                  result.rawDistance,
                   graffitiEngineLabel(result.backend), result.tokenCount,
                   g_graffitiEngine.lastTokenSequence(),
                   static_cast<unsigned long>(g_graffitiLastInferUs),

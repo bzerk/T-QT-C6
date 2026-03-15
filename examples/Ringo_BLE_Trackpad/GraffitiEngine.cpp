@@ -39,6 +39,14 @@ const char *GraffitiEngine::conditionName() const {
   }
 }
 
+void GraffitiEngine::setAcceptConfidence(float threshold) {
+  acceptConfidence_ = threshold;
+}
+
+float GraffitiEngine::acceptConfidence() const {
+  return acceptConfidence_;
+}
+
 bool GraffitiEngine::resampleStroke(const Point *input, uint16_t count, Point *out, uint16_t outCount) {
   if (input == nullptr || out == nullptr || count == 0 || outCount == 0) {
     return false;
@@ -229,7 +237,7 @@ bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) 
   out.rawScore = margin;
   out.rawDistance = bestDistance;
   out.backend = Backend::Prototype;
-  out.accepted = (confidence >= kAcceptConfidence);
+  out.accepted = (confidence >= acceptConfidence_);
   out.tokenCount = 0;
 
   strlcpy(lastSequence_, conditionName(), sizeof(lastSequence_));
