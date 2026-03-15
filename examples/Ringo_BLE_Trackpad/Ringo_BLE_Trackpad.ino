@@ -158,8 +158,9 @@ enum class HostPickerMode : uint8_t {
 };
 
 constexpr uint8_t kHostPickerMaxEntries = 8;
-constexpr uint8_t kHostPickerVisibleRows = 5;
-constexpr int16_t kHostPickerRowHeight = 22;
+constexpr uint8_t kHostPickerVisibleRows = 4;
+constexpr int16_t kHostPickerRowHeight = 26;
+constexpr int16_t kHostPickerListTopY = 18;
 
 struct HostSelectionRecord {
   uint32_t magic;
@@ -360,6 +361,7 @@ bool loadSelectedHostFromNvs();
 bool saveSelectedHostToNvs();
 void refreshBondedHosts();
 void applySelectedHostFilter();
+uint8_t hostPickerItemCount();
 String formatHostLabel(uint8_t index);
 void enterHostPicker();
 void exitHostPicker(bool refreshDisplay = true);
@@ -1156,21 +1158,29 @@ void applySelectedHostFilter() {
   }
 }
 
+uint8_t hostPickerItemCount() {
+  return static_cast<uint8_t>(std::min<int>(kHostPickerMaxEntries + 1, g_bondedHostCount + 1));
+}
+
 String formatHostLabel(uint8_t index) {
-  if (index >= g_bondedHostCount || !g_bondedHosts[index].inUse) {
+  if (index == 0) {
+    return String(g_selectedHostValid ? "  ANY" : "* ANY");
+  }
+  const uint8_t hostIndex = index - 1;
+  if (hostIndex >= g_bondedHostCount || !g_bondedHosts[hostIndex].inUse) {
     return "-";
   }
   char buf[24];
   snprintf(buf, sizeof(buf), "%c %02X:%02X:%02X",
-           (static_cast<int8_t>(index) == g_selectedBondedHostIndex) ? '*' : ' ',
-           g_bondedHosts[index].addr[3], g_bondedHosts[index].addr[4], g_bondedHosts[index].addr[5]);
+           (static_cast<int8_t>(hostIndex) == g_selectedBondedHostIndex) ? '*' : ' ',
+           g_bondedHosts[hostIndex].addr[3], g_bondedHosts[hostIndex].addr[4], g_bondedHosts[hostIndex].addr[5]);
   return String(buf);
 }
 
 void enterHostPicker() {
   refreshBondedHosts();
   if (g_selectedBondedHostIndex >= 0) {
-    g_hostPickerTopIndex = static_cast<uint8_t>(std::max<int>(0, g_selectedBondedHostIndex - 1));
+    g_hostPickerTopIndex = static_cast<uint8_t>(std::max<int>(0, g_selectedBondedHostIndex));
   } else {
     g_hostPickerTopIndex = 0;
   }
@@ -2512,6 +2522,9 @@ void sampleHostPickerTouch() {
     const bool tapLike = (pressDuration <= kTouchTapMaxDurationMs &&
                           absDx <= kTouchTapMoveThresholdPx &&
                           absDy <= kTouchTapMoveThresholdPx);
+    const bool longPress = (pressDuration >= kGraffitiCommandLongPressMs &&
+                            absDx <= kTouchTapMoveThresholdPx &&
+                            absDy <= kTouchTapMoveThresholdPx);
     const bool swipeUp = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
                           deltaY <= -kGraffitiCommandSwipeMinDyPx &&
                           absDx <= kGraffitiCommandSwipeMaxDxPx);
@@ -2530,7 +2543,7 @@ void sampleHostPickerTouch() {
       renderStatus(true);
       return;
     }
-    if (swipeDown && (g_hostPickerTopIndex + kHostPickerVisibleRows) < g_bondedHostCount) {
+    if (swipeDown && (g_hostPickerTopIndex + kHostPickerVisibleRows) < hostPickerItemCount()) {
       ++g_hostPickerTopIndex;
       renderStatus(true);
       return;
@@ -2539,11 +2552,11 @@ void sampleHostPickerTouch() {
       exitHostPicker(true);
       return;
     }
-    if (!tapLike) {
+    if (!tapLike && !longPress) {
       return;
     }
 
-    const int16_t relativeY = g_touchDownY - 18;
+    const int16_t relativeY = g_touchDownY - kHostPickerListTopY;
     if (relativeY < 0) {
       exitHostPicker(true);
       return;
@@ -2553,16 +2566,63 @@ void sampleHostPickerTouch() {
       exitHostPicker(true);
       return;
     }
-    const uint8_t index = g_hostPickerTopIndex + static_cast<uint8_t>(row);
-    if (index >= g_bondedHostCount || !g_bondedHosts[index].inUse) {
+    const uint8_t itemIndex = g_hostPickerTopIndex + static_cast<uint8_t>(row);
+    const uint8_t itemCount = hostPickerItemCount();
+    if (itemIndex >= itemCount) {
       exitHostPicker(true);
       return;
     }
 
-    memcpy(g_selectedHostAddr, g_bondedHosts[index].addr, sizeof(g_selectedHostAddr));
-    g_selectedHostAddrType = g_bondedHosts[index].addrType;
-    g_selectedHostValid = true;
-    g_selectedBondedHostIndex = static_cast<int8_t>(index);
+    if (longPress) {
+      if (itemIndex == 0) {
+        return;
+      }
+      const uint8_t hostIndex = itemIndex - 1;
+      if (hostIndex >= g_bondedHostCount || !g_bondedHosts[hostIndex].inUse) {
+        return;
+      }
+      const bool deletingSelected = (static_cast<int8_t>(hostIndex) == g_selectedBondedHostIndex);
+      esp_ble_remove_bond_device(g_bondedHosts[hostIndex].addr);
+      if (deletingSelected) {
+        g_selectedHostValid = false;
+        g_selectedBondedHostIndex = -1;
+        memset(g_selectedHostAddr, 0, sizeof(g_selectedHostAddr));
+        g_selectedHostAddrType = BLE_WL_ADDR_TYPE_PUBLIC;
+        saveSelectedHostToNvs();
+      }
+      refreshBondedHosts();
+      applySelectedHostFilter();
+      if (g_bleConnected && g_bleServer != nullptr) {
+        g_bleServer->disconnect(g_bleServer->getConnId());
+      } else if (g_advertising != nullptr) {
+        g_advertising->stop();
+        delay(30);
+        g_advertising->start();
+      }
+      if (g_hostPickerTopIndex >= hostPickerItemCount() && g_hostPickerTopIndex > 0) {
+        g_hostPickerTopIndex = hostPickerItemCount() - 1;
+      }
+      g_graffitiStatus = "HOST DEL";
+      renderStatus(true);
+      return;
+    }
+
+    if (itemIndex == 0) {
+      g_selectedHostValid = false;
+      g_selectedBondedHostIndex = -1;
+      memset(g_selectedHostAddr, 0, sizeof(g_selectedHostAddr));
+      g_selectedHostAddrType = BLE_WL_ADDR_TYPE_PUBLIC;
+    } else {
+      const uint8_t hostIndex = itemIndex - 1;
+      if (hostIndex >= g_bondedHostCount || !g_bondedHosts[hostIndex].inUse) {
+        exitHostPicker(true);
+        return;
+      }
+      memcpy(g_selectedHostAddr, g_bondedHosts[hostIndex].addr, sizeof(g_selectedHostAddr));
+      g_selectedHostAddrType = g_bondedHosts[hostIndex].addrType;
+      g_selectedHostValid = true;
+      g_selectedBondedHostIndex = static_cast<int8_t>(hostIndex);
+    }
     saveSelectedHostToNvs();
     applySelectedHostFilter();
     disarmHidOutput(kHidReconnectGraceMs, "host switch");
@@ -2573,7 +2633,7 @@ void sampleHostPickerTouch() {
       delay(30);
       g_advertising->start();
     }
-    g_graffitiStatus = "HOST SET";
+    g_graffitiStatus = (itemIndex == 0) ? "HOST ANY" : "HOST SET";
     exitHostPicker(true);
     return;
   }
@@ -3125,15 +3185,17 @@ void renderStatus(bool force) {
     gfx->setTextSize(1);
     gfx->setCursor(2, 8);
     gfx->print("Hosts");
-    gfx->setCursor(54, 8);
-    gfx->print("tap=pick");
+    gfx->setCursor(38, 8);
+    gfx->print("tap pick hold del");
     for (uint8_t row = 0; row < kHostPickerVisibleRows; ++row) {
       const uint8_t index = g_hostPickerTopIndex + row;
-      const int16_t y = 18 + (row * kHostPickerRowHeight);
-      const bool valid = index < g_bondedHostCount && g_bondedHosts[index].inUse;
-      const bool selected = valid && (static_cast<int8_t>(index) == g_selectedBondedHostIndex);
+      const int16_t y = kHostPickerListTopY + (row * kHostPickerRowHeight);
+      const bool valid = index < hostPickerItemCount();
+      const bool selected = (index == 0) ? !g_selectedHostValid :
+                            (valid && static_cast<int8_t>(index - 1) == g_selectedBondedHostIndex);
       gfx->drawRect(0, y, LCD_WIDTH, kHostPickerRowHeight - 2, selected ? CYAN : DARKGREY);
-      gfx->setCursor(4, y + 7);
+      gfx->setTextSize(2);
+      gfx->setCursor(4, y + 6);
       gfx->setTextColor(selected ? CYAN : WHITE, BLACK);
       gfx->print(valid ? formatHostLabel(index) : String("-"));
     }
