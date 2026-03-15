@@ -107,6 +107,10 @@ constexpr uint32_t kUiCfgRecordMagic = 0x52435549;  // "RCUI"
 constexpr uint16_t kUiCfgRecordVersion = 1;
 constexpr char kInputModeNvsNamespace[] = "ringo_mode";
 constexpr char kInputModeNvsKey[] = "input_mode";
+constexpr char kHostSelNvsNamespace[] = "ringo_host";
+constexpr char kHostSelNvsKey[] = "selected";
+constexpr uint32_t kHostSelRecordMagic = 0x52484f53;  // "RHOS"
+constexpr uint16_t kHostSelRecordVersion = 1;
 constexpr float kDefaultScrollGain = 0.70f;
 constexpr float kMinScrollGain = 0.10f;
 constexpr float kMaxScrollGain = 2.00f;
@@ -148,11 +152,36 @@ enum class GraffitiCommandPoseAction : uint8_t {
   ArmCtrl,
 };
 
+enum class HostPickerMode : uint8_t {
+  Off,
+  Active,
+};
+
+constexpr uint8_t kHostPickerMaxEntries = 8;
+constexpr uint8_t kHostPickerVisibleRows = 5;
+constexpr int16_t kHostPickerRowHeight = 22;
+
+struct HostSelectionRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint8_t addr[6];
+  uint8_t addrType;
+  uint8_t valid;
+};
+
+struct BondedHostEntry {
+  uint8_t addr[6] = {0};
+  uint8_t addrType = BLE_WL_ADDR_TYPE_PUBLIC;
+  bool inUse = false;
+};
+
 volatile bool g_touchInterrupt = false;
 bool g_bleConnected = false;
 bool g_touchActive = false;
 bool g_imuReady = false;
 InputMode g_inputMode = InputMode::Mouse;
+BLEServer *g_bleServer = nullptr;
 
 uint32_t g_lastTouchEventMs = 0;
 uint32_t g_lastTouchPollMs = 0;
@@ -270,6 +299,14 @@ char g_ctrlPreviewSymbol = 0;
 GraffitiCommandPoseAction g_commandPosePendingAction = GraffitiCommandPoseAction::None;
 bool g_hidOutputArmed = false;
 uint32_t g_hidQuietUntilMs = 0;
+HostPickerMode g_hostPickerMode = HostPickerMode::Off;
+BondedHostEntry g_bondedHosts[kHostPickerMaxEntries];
+uint8_t g_bondedHostCount = 0;
+int8_t g_selectedBondedHostIndex = -1;
+bool g_selectedHostValid = false;
+uint8_t g_selectedHostAddr[6] = {0};
+uint8_t g_selectedHostAddrType = BLE_WL_ADDR_TYPE_PUBLIC;
+uint8_t g_hostPickerTopIndex = 0;
 uint8_t g_arrowHeldUsage = 0;
 uint32_t g_arrowRepeatDueMs = 0;
 uint32_t g_arrowModeEnteredMs = 0;
@@ -319,6 +356,14 @@ void sampleGraffitiCtrlPreviewTouch();
 void disarmHidOutput(uint32_t quietMs, const char *reason);
 void armHidOutput(const char *reason);
 bool canEmitHidOutput();
+bool loadSelectedHostFromNvs();
+bool saveSelectedHostToNvs();
+void refreshBondedHosts();
+void applySelectedHostFilter();
+String formatHostLabel(uint8_t index);
+void enterHostPicker();
+void exitHostPicker(bool refreshDisplay = true);
+void sampleHostPickerTouch();
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -1017,6 +1062,135 @@ bool loadInputModeFromNvs(InputMode &mode) {
       ? InputMode::Graffiti
       : InputMode::Mouse;
   return true;
+}
+
+bool loadSelectedHostFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kHostSelNvsNamespace, true)) {
+    return false;
+  }
+  const size_t storedLen = prefs.getBytesLength(kHostSelNvsKey);
+  if (storedLen != sizeof(HostSelectionRecord)) {
+    prefs.end();
+    return false;
+  }
+
+  HostSelectionRecord record = {};
+  const size_t readLen = prefs.getBytes(kHostSelNvsKey, &record, sizeof(record));
+  prefs.end();
+  if (readLen != sizeof(record)) {
+    return false;
+  }
+  if (record.magic != kHostSelRecordMagic || record.version != kHostSelRecordVersion || record.valid == 0) {
+    return false;
+  }
+
+  memcpy(g_selectedHostAddr, record.addr, sizeof(g_selectedHostAddr));
+  g_selectedHostAddrType = record.addrType;
+  g_selectedHostValid = true;
+  return true;
+}
+
+bool saveSelectedHostToNvs() {
+  Preferences prefs;
+  if (!prefs.begin(kHostSelNvsNamespace, false)) {
+    return false;
+  }
+
+  HostSelectionRecord record = {};
+  record.magic = kHostSelRecordMagic;
+  record.version = kHostSelRecordVersion;
+  record.addrType = g_selectedHostAddrType;
+  record.valid = g_selectedHostValid ? 1 : 0;
+  memcpy(record.addr, g_selectedHostAddr, sizeof(record.addr));
+
+  const size_t written = prefs.putBytes(kHostSelNvsKey, &record, sizeof(record));
+  prefs.end();
+  return written == sizeof(record);
+}
+
+void refreshBondedHosts() {
+  g_bondedHostCount = 0;
+  g_selectedBondedHostIndex = -1;
+  for (uint8_t i = 0; i < kHostPickerMaxEntries; ++i) {
+    g_bondedHosts[i] = BondedHostEntry{};
+  }
+
+  int devNum = esp_ble_get_bond_device_num();
+  if (devNum <= 0) {
+    return;
+  }
+  std::unique_ptr<esp_ble_bond_dev_t[]> devs(new esp_ble_bond_dev_t[devNum]);
+  if (esp_ble_get_bond_device_list(&devNum, devs.get()) != ESP_OK) {
+    return;
+  }
+  const int limit = std::min<int>(devNum, kHostPickerMaxEntries);
+  for (int i = 0; i < limit; ++i) {
+    memcpy(g_bondedHosts[i].addr, devs[i].bd_addr, sizeof(g_bondedHosts[i].addr));
+    g_bondedHosts[i].addrType = static_cast<uint8_t>(devs[i].bd_addr_type);
+    g_bondedHosts[i].inUse = true;
+    ++g_bondedHostCount;
+    if (g_selectedHostValid &&
+        memcmp(g_selectedHostAddr, g_bondedHosts[i].addr, sizeof(g_selectedHostAddr)) == 0) {
+      g_selectedBondedHostIndex = i;
+    }
+  }
+}
+
+void applySelectedHostFilter() {
+  if (g_advertising == nullptr) {
+    return;
+  }
+  esp_ble_gap_clear_whitelist();
+  if (g_selectedHostValid) {
+    esp_ble_gap_update_whitelist(true, g_selectedHostAddr,
+                                 static_cast<esp_ble_wl_addr_type_t>(g_selectedHostAddrType));
+    g_advertising->setScanFilter(false, true);
+    Serial.printf("[host] selected=%02X:%02X:%02X:%02X:%02X:%02X type=%u\n",
+                  g_selectedHostAddr[0], g_selectedHostAddr[1], g_selectedHostAddr[2],
+                  g_selectedHostAddr[3], g_selectedHostAddr[4], g_selectedHostAddr[5],
+                  static_cast<unsigned>(g_selectedHostAddrType));
+  } else {
+    g_advertising->setScanFilter(false, false);
+    Serial.println("[host] selected=ANY");
+  }
+}
+
+String formatHostLabel(uint8_t index) {
+  if (index >= g_bondedHostCount || !g_bondedHosts[index].inUse) {
+    return "-";
+  }
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%c %02X:%02X:%02X",
+           (static_cast<int8_t>(index) == g_selectedBondedHostIndex) ? '*' : ' ',
+           g_bondedHosts[index].addr[3], g_bondedHosts[index].addr[4], g_bondedHosts[index].addr[5]);
+  return String(buf);
+}
+
+void enterHostPicker() {
+  refreshBondedHosts();
+  if (g_selectedBondedHostIndex >= 0) {
+    g_hostPickerTopIndex = static_cast<uint8_t>(std::max<int>(0, g_selectedBondedHostIndex - 1));
+  } else {
+    g_hostPickerTopIndex = 0;
+  }
+  g_hostPickerMode = HostPickerMode::Active;
+  g_graffitiStatus = "HOST PICK";
+  g_touchDown = false;
+  g_touchActive = false;
+  renderStatus(true);
+}
+
+void exitHostPicker(bool refreshDisplay) {
+  g_hostPickerMode = HostPickerMode::Off;
+  g_touchDown = false;
+  g_touchActive = false;
+  if (g_inputMode == InputMode::Graffiti) {
+    g_graffitiStatus = "READY";
+  }
+  if (refreshDisplay) {
+    renderStatus(true);
+  }
 }
 
 void resetStationaryBiasEstimator() {
@@ -2166,6 +2340,9 @@ void sampleGraffitiExitTapOnly() {
     const bool swipeRight = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
                              deltaX >= kGraffitiCommandSwipeMinDyPx &&
                              absDy <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeLeft = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                            deltaX <= -kGraffitiCommandSwipeMinDyPx &&
+                            absDy <= kGraffitiCommandSwipeMaxDxPx);
     const bool longPress = (pressDuration >= kGraffitiCommandLongPressMs &&
                             absDx <= kTouchTapMoveThresholdPx &&
                             absDy <= kTouchTapMoveThresholdPx);
@@ -2214,6 +2391,12 @@ void sampleGraffitiExitTapOnly() {
         g_graffitiStatus = "DISP OFF";
       }
       resetGraffitiTapSwitchState();
+      return;
+    }
+
+    if (swipeLeft) {
+      resetGraffitiTapSwitchState();
+      enterHostPicker();
       return;
     }
 
@@ -2300,6 +2483,105 @@ void sampleGraffitiCtrlPreviewTouch() {
   g_touchY = y;
   g_lastTouchEventMs = now;
 
+  if (!g_touchDown) {
+    g_touchDown = true;
+    g_touchDownStartMs = now;
+    g_touchDownX = x;
+    g_touchDownY = y;
+  }
+}
+
+void sampleHostPickerTouch() {
+  const uint32_t now = millis();
+  int16_t finger = 0;
+  int16_t x = -1;
+  int16_t y = -1;
+  const bool readOk = readTouchSnapshot(finger, x, y);
+
+  if (!readOk || finger <= 0) {
+    if (!g_touchDown) {
+      g_touchActive = false;
+      return;
+    }
+
+    const uint32_t pressDuration = now - g_touchDownStartMs;
+    const int16_t deltaX = g_touchX - g_touchDownX;
+    const int16_t deltaY = g_touchY - g_touchDownY;
+    const int16_t absDx = abs(deltaX);
+    const int16_t absDy = abs(deltaY);
+    const bool tapLike = (pressDuration <= kTouchTapMaxDurationMs &&
+                          absDx <= kTouchTapMoveThresholdPx &&
+                          absDy <= kTouchTapMoveThresholdPx);
+    const bool swipeUp = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                          deltaY <= -kGraffitiCommandSwipeMinDyPx &&
+                          absDx <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeDown = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                            deltaY >= kGraffitiCommandSwipeMinDyPx &&
+                            absDx <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeLeft = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                            deltaX <= -kGraffitiCommandSwipeMinDyPx &&
+                            absDy <= kGraffitiCommandSwipeMaxDxPx);
+
+    g_touchDown = false;
+    g_touchActive = false;
+
+    if (swipeUp && g_hostPickerTopIndex > 0) {
+      --g_hostPickerTopIndex;
+      renderStatus(true);
+      return;
+    }
+    if (swipeDown && (g_hostPickerTopIndex + kHostPickerVisibleRows) < g_bondedHostCount) {
+      ++g_hostPickerTopIndex;
+      renderStatus(true);
+      return;
+    }
+    if (swipeLeft) {
+      exitHostPicker(true);
+      return;
+    }
+    if (!tapLike) {
+      return;
+    }
+
+    const int16_t relativeY = g_touchDownY - 18;
+    if (relativeY < 0) {
+      exitHostPicker(true);
+      return;
+    }
+    const int16_t row = relativeY / kHostPickerRowHeight;
+    if (row < 0 || row >= kHostPickerVisibleRows) {
+      exitHostPicker(true);
+      return;
+    }
+    const uint8_t index = g_hostPickerTopIndex + static_cast<uint8_t>(row);
+    if (index >= g_bondedHostCount || !g_bondedHosts[index].inUse) {
+      exitHostPicker(true);
+      return;
+    }
+
+    memcpy(g_selectedHostAddr, g_bondedHosts[index].addr, sizeof(g_selectedHostAddr));
+    g_selectedHostAddrType = g_bondedHosts[index].addrType;
+    g_selectedHostValid = true;
+    g_selectedBondedHostIndex = static_cast<int8_t>(index);
+    saveSelectedHostToNvs();
+    applySelectedHostFilter();
+    disarmHidOutput(kHidReconnectGraceMs, "host switch");
+    if (g_bleConnected && g_bleServer != nullptr) {
+      g_bleServer->disconnect(g_bleServer->getConnId());
+    } else if (g_advertising != nullptr) {
+      g_advertising->stop();
+      delay(30);
+      g_advertising->start();
+    }
+    g_graffitiStatus = "HOST SET";
+    exitHostPicker(true);
+    return;
+  }
+
+  g_touchActive = true;
+  g_touchX = x;
+  g_touchY = y;
+  g_lastTouchEventMs = now;
   if (!g_touchDown) {
     g_touchDown = true;
     g_touchDownStartMs = now;
@@ -2784,6 +3066,7 @@ void initBleMouse() {
 
   BLEDevice::init(kDeviceName);
   BLEServer *server = BLEDevice::createServer();
+  g_bleServer = server;
   server->setCallbacks(new ServerCallbacks());
 
   g_hid = new BLEHIDDevice(server);
@@ -2808,6 +3091,7 @@ void initBleMouse() {
   g_advertising = server->getAdvertising();
   g_advertising->setAppearance(GENERIC_HID);
   g_advertising->addServiceUUID(g_hid->hidService()->getUUID());
+  applySelectedHostFilter();
   g_advertising->start();
 
   Serial.println("[ble] HID mouse+keyboard started, advertising as 'Ringo'");
@@ -2817,6 +3101,7 @@ void renderStatus(bool force) {
   const uint32_t now = millis();
   const bool rejectFlashActive = static_cast<int32_t>(now - g_rejectFlashUntilMs) < 0;
   const bool overlayActive =
+      (g_hostPickerMode == HostPickerMode::Active) ||
       (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) ||
       (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct ||
       g_graffitiOneShotCtrl || g_ctrlPreviewActive || rejectFlashActive;
@@ -2830,6 +3115,28 @@ void renderStatus(bool force) {
 
   if (rejectFlashActive) {
     gfx->fillScreen(WHITE);
+    g_statusFrameDrawn = false;
+    return;
+  }
+
+  if (g_hostPickerMode == HostPickerMode::Active) {
+    gfx->fillScreen(BLACK);
+    gfx->setTextColor(WHITE, BLACK);
+    gfx->setTextSize(1);
+    gfx->setCursor(2, 8);
+    gfx->print("Hosts");
+    gfx->setCursor(54, 8);
+    gfx->print("tap=pick");
+    for (uint8_t row = 0; row < kHostPickerVisibleRows; ++row) {
+      const uint8_t index = g_hostPickerTopIndex + row;
+      const int16_t y = 18 + (row * kHostPickerRowHeight);
+      const bool valid = index < g_bondedHostCount && g_bondedHosts[index].inUse;
+      const bool selected = valid && (static_cast<int8_t>(index) == g_selectedBondedHostIndex);
+      gfx->drawRect(0, y, LCD_WIDTH, kHostPickerRowHeight - 2, selected ? CYAN : DARKGREY);
+      gfx->setCursor(4, y + 7);
+      gfx->setTextColor(selected ? CYAN : WHITE, BLACK);
+      gfx->print(valid ? formatHostLabel(index) : String("-"));
+    }
     g_statusFrameDrawn = false;
     return;
   }
@@ -3207,6 +3514,7 @@ void setup() {
     g_scrollGain = kDefaultScrollGain;
     Serial.printf("[cfg] using default scroll_gain=%.2f\n", g_scrollGain);
   }
+  loadSelectedHostFromNvs();
   initBleMouse();
   InputMode restoredInputMode = InputMode::Mouse;
   if (loadInputModeFromNvs(restoredInputMode) && restoredInputMode == InputMode::Graffiti) {
@@ -3237,6 +3545,9 @@ void loop() {
   }
 
   if (g_imuReady) {
+    if (g_hostPickerMode == HostPickerMode::Active) {
+      // Suspend IMU-driven interaction while the host picker owns the UI.
+    } else {
     const bool airMouseActive = (g_inputMode == InputMode::Mouse) && !g_graffitiTapOnlyActive;
     const bool graffitiStrokeActive = (g_inputMode == InputMode::Graffiti) && (g_touchDown || g_touchActive);
     const uint32_t imuPollMs = airMouseActive ? kImuPollMs : kGraffitiImuPollMs;
@@ -3248,17 +3559,24 @@ void loop() {
         updateImuOrientationOnly();
       }
     }
+    }
   }
 
-  updateGraffitiTapOnlyMode();
+  if (g_hostPickerMode != HostPickerMode::Active) {
+    updateGraffitiTapOnlyMode();
+  }
 
-  const bool touchNeedsPolling = touchEdge || g_touchDown || g_touchActive || g_graffitiTapOnlyActive;
+  const bool touchNeedsPolling =
+      touchEdge || g_touchDown || g_touchActive || g_graffitiTapOnlyActive ||
+      (g_hostPickerMode == HostPickerMode::Active);
   const uint32_t touchPollMs = (g_inputMode == InputMode::Graffiti || g_graffitiTapOnlyActive)
                                    ? kGraffitiTouchPollMs
                                    : kTouchPollMs;
   if (touchNeedsPolling && (now - g_lastTouchPollMs) >= touchPollMs) {
     g_lastTouchPollMs = now;
-    if (g_graffitiTapOnlyActive) {
+    if (g_hostPickerMode == HostPickerMode::Active) {
+      sampleHostPickerTouch();
+    } else if (g_graffitiTapOnlyActive) {
       sampleGraffitiExitTapOnly();
     } else if (g_inputMode == InputMode::Mouse) {
       sampleTouchState();
@@ -3271,7 +3589,8 @@ void loop() {
     g_touchActive = false;
   }
 
-  if (g_inputMode == InputMode::Mouse && !g_graffitiTapOnlyActive) {
+  if (g_hostPickerMode == HostPickerMode::Off &&
+      g_inputMode == InputMode::Mouse && !g_graffitiTapOnlyActive) {
     if (g_tapArmed && static_cast<int32_t>(g_tapArmDeadlineMs - now) < 0) {
       g_tapArmed = false;
       if (!g_leftLockActive) {
@@ -3280,7 +3599,8 @@ void loop() {
     }
   }
 
-  if (g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
+  if (g_hostPickerMode == HostPickerMode::Off &&
+      g_graffitiTapArmed && (now - g_graffitiTapArmedMs) > kModeExitDoubleTapWindowMs) {
     resetGraffitiTapSwitchState();
     if (!g_touchDown) {
       if (g_graffitiTapOnlyActive) {
@@ -3295,7 +3615,9 @@ void loop() {
     }
   }
 
-  serviceCompletedGraffitiQueue();
+  if (g_hostPickerMode == HostPickerMode::Off) {
+    serviceCompletedGraffitiQueue();
+  }
   updateDisplayBacklight();
   renderStatus();
   delay(2);
