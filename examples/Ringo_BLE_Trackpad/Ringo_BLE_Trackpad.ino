@@ -58,8 +58,10 @@ constexpr int16_t kGraffitiCommandSwipeMinDyPx = 28;
 constexpr int16_t kGraffitiCommandSwipeMaxDxPx = 40;
 constexpr uint32_t kArrowRepeatInitialMs = 280;
 constexpr uint32_t kArrowRepeatMs = 85;
+constexpr uint32_t kArrowIntroMs = 3000;
 constexpr int16_t kArrowEdgeMarginPx = 26;
 constexpr int16_t kArrowCenterHalfSizePx = 18;
+constexpr int16_t kArrowEdgeBarThicknessPx = 6;
 constexpr int16_t kCstIdleX = 60;
 constexpr int16_t kCstIdleY = 150;
 constexpr uint8_t kGraffitiCaptureLabelMaxLen = 16;
@@ -251,6 +253,7 @@ GraffitiShiftMode g_graffitiShiftMode = GraffitiShiftMode::Off;
 bool g_graffitiOneShotPunct = false;
 uint8_t g_arrowHeldUsage = 0;
 uint32_t g_arrowRepeatDueMs = 0;
+uint32_t g_arrowModeEnteredMs = 0;
 bool g_modeFlipRefReady = false;
 uint8_t g_modeFlipRefAxis = 2;
 float g_modeFlipRefSign = 1.0f;
@@ -602,6 +605,10 @@ void setGraffitiGlyphMode(GraffitiGlyphMode mode) {
   g_graffitiGlyphMode = mode;
   if (mode == GraffitiGlyphMode::Arrow) {
     g_graffitiOneShotPunct = false;
+    g_arrowModeEnteredMs = millis();
+  } else {
+    g_arrowHeldUsage = 0;
+    g_arrowModeEnteredMs = 0;
   }
 }
 
@@ -2525,6 +2532,7 @@ void renderStatus(bool force) {
   const uint32_t now = millis();
   const bool rejectFlashActive = static_cast<int32_t>(now - g_rejectFlashUntilMs) < 0;
   const bool overlayActive =
+      (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) ||
       (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct || rejectFlashActive;
   if (!g_displayEnabled && !overlayActive) {
     return;
@@ -2542,6 +2550,25 @@ void renderStatus(bool force) {
 
   if (!g_displayEnabled) {
     gfx->fillScreen(BLACK);
+    if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) {
+      const bool showIntro = static_cast<int32_t>(now - (g_arrowModeEnteredMs + kArrowIntroMs)) < 0;
+      uint8_t arrowUsage = g_arrowHeldUsage;
+      if (arrowUsage == 0 && g_touchActive) {
+        arrowUsage = arrowUsageForPoint(g_touchX, g_touchY);
+      }
+      if (arrowUsage == 0x50) {
+        gfx->fillRect(0, 0, kArrowEdgeBarThicknessPx, LCD_HEIGHT, CYAN);
+      } else if (arrowUsage == 0x4F) {
+        gfx->fillRect(LCD_WIDTH - kArrowEdgeBarThicknessPx, 0, kArrowEdgeBarThicknessPx, LCD_HEIGHT, CYAN);
+      } else if (arrowUsage == 0x52) {
+        gfx->fillRect(0, 0, LCD_WIDTH, kArrowEdgeBarThicknessPx, CYAN);
+      } else if (arrowUsage == 0x51) {
+        gfx->fillRect(0, LCD_HEIGHT - kArrowEdgeBarThicknessPx, LCD_WIDTH, kArrowEdgeBarThicknessPx, CYAN);
+      }
+      if (showIntro) {
+        gfx->drawCircle(LCD_WIDTH / 2, LCD_HEIGHT / 2, 10, WHITE);
+      }
+    }
     if (g_graffitiShiftMode != GraffitiShiftMode::Off) {
       gfx->fillRect(0, 0, LCD_WIDTH, LCD_HEIGHT / 8, WHITE);
     }
