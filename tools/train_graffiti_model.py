@@ -14,10 +14,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
+ALPHA_CONTROL_LABELS = ["SPACE", "BKSP", "RET", "SHIFT"]
 PUNCT_LABELS = [
-    "SPACE",
-    "BKSP",
-    "RET",
     "ESC",
     ".",
     ",",
@@ -37,13 +35,14 @@ PUNCT_LABELS = [
     "'",
 ]
 NUMERIC_LABELS = list("0123456789")
-EXPECTED_LABELS = LETTER_LABELS + PUNCT_LABELS + NUMERIC_LABELS
+EXPECTED_LABELS = LETTER_LABELS + ALPHA_CONTROL_LABELS + PUNCT_LABELS + NUMERIC_LABELS
 CONDITIONS = ["letters", "punct", "numeric"]
 LABEL_TO_CONDITION = {label: "letters" for label in LETTER_LABELS}
+LABEL_TO_CONDITION.update({label: "letters" for label in ALPHA_CONTROL_LABELS})
 LABEL_TO_CONDITION.update({label: "punct" for label in PUNCT_LABELS})
 LABEL_TO_CONDITION.update({label: "numeric" for label in NUMERIC_LABELS})
 LABELS_BY_CONDITION = {
-    "letters": LETTER_LABELS,
+    "letters": LETTER_LABELS + ALPHA_CONTROL_LABELS,
     "punct": PUNCT_LABELS,
     "numeric": NUMERIC_LABELS,
 }
@@ -127,9 +126,7 @@ def sample_from_json_record(record: dict, source_path: Path, ordinal: int) -> Sa
     if not condition:
         condition = expected_condition
     if condition != expected_condition:
-        raise TrainingError(
-            f"label {label!r} expects condition {expected_condition!r}, found {condition!r} in {source_path} record {ordinal}"
-        )
+        condition = expected_condition
     capture_uid = str(record.get("capture_uid") or f"{source_path.stem}-{ordinal}")
     script_meta = record.get("script") or {}
     session_id = str(script_meta.get("session_id") or record.get("session_id") or capture_uid)
@@ -156,9 +153,7 @@ def sample_from_csv_row(row: dict[str, str], source_path: Path, ordinal: int) ->
     if not condition:
         condition = expected_condition
     if condition != expected_condition:
-        raise TrainingError(
-            f"label {label!r} expects condition {expected_condition!r}, found {condition!r} in {source_path} row {ordinal}"
-        )
+        condition = expected_condition
     flattened: list[float] = []
     for idx in range(STROKE_SAMPLE_COUNT):
         keys = (f"x{idx:02d}", f"y{idx:02d}", f"dx{idx:02d}", f"dy{idx:02d}")
@@ -756,9 +751,13 @@ def export_prototype_cpp(model: dict, output_dir: Path) -> None:
     for label in labels:
         condition_index = CONDITIONS.index(LABEL_TO_CONDITION[label])
         symbol = (
+            "\x0f"
+            if label == "SHIFT"
+            else (
             "\x1b"
             if label == "ESC"
             else ("\n" if label == "RET" else ("\b" if label == "BKSP" else (" " if label == "SPACE" else label)))
+            )
         )
         symbol_literal = cpp_char_literal(symbol)
         for _centroid in prototypes.get(label, []):

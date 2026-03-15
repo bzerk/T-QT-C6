@@ -37,10 +37,8 @@ MODE_SWITCH_RE = re.compile(r"^\[mode\] switched to ([A-Z]+)")
 BOOT_BANNER_RE = re.compile(r"^\[boot\] Ringo BLE trackpad starting$")
 
 LETTER_LABELS = list("abcdefghijklmnopqrstuvwxyz")
+ALPHA_CONTROL_LABELS = ["SPACE", "BKSP", "RET", "SHIFT"]
 PUNCT_LABELS = [
-    "SPACE",
-    "BKSP",
-    "RET",
     "ESC",
     ".",
     ",",
@@ -60,6 +58,7 @@ PUNCT_LABELS = [
     "'",
 ]
 NUMERIC_LABELS = list("0123456789")
+ALPHA_CONTROL_SET = set(ALPHA_CONTROL_LABELS)
 PUNCT_SET = set(PUNCT_LABELS)
 NUMERIC_SET = set(NUMERIC_LABELS)
 LETTER_SET = set(LETTER_LABELS)
@@ -71,6 +70,7 @@ TOKEN_ALIASES = {
     "ret": "RET",
     "return": "RET",
     "enter": "RET",
+    "shift": "SHIFT",
     "esc": "ESC",
     "escape": "ESC",
     "apostrophe": "'",
@@ -229,7 +229,7 @@ def normalize_target_token(token: str) -> str:
 
 
 def infer_condition(label: str) -> Optional[str]:
-    if label in LETTER_SET:
+    if label in LETTER_SET or label in ALPHA_CONTROL_SET:
         return "letters"
     if label in PUNCT_SET:
         return "punct"
@@ -271,6 +271,7 @@ def prompt_specs_for_preset(preset: str) -> list[PromptSpec]:
     if preset == "all":
         return (
             [PromptSpec(label, "letters") for label in LETTER_LABELS]
+            + [PromptSpec(label, "letters") for label in ALPHA_CONTROL_LABELS]
             + [PromptSpec(label, "punct") for label in PUNCT_LABELS]
             + [PromptSpec(label, "numeric") for label in NUMERIC_LABELS]
         )
@@ -285,7 +286,7 @@ def target_text_for_preset(preset: str) -> str:
     if preset == "numeric":
         return "".join(NUMERIC_LABELS)
     if preset == "all":
-        return " ".join(LETTER_LABELS + PUNCT_LABELS + NUMERIC_LABELS)
+        return " ".join(LETTER_LABELS + ALPHA_CONTROL_LABELS + PUNCT_LABELS + NUMERIC_LABELS)
     return ""
 
 

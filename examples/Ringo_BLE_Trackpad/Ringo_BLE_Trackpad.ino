@@ -1642,6 +1642,9 @@ String graffitiSymbolLabel(char symbol) {
   if (symbol == 0x1B) {
     return "ESC";
   }
+  if (symbol == 0x0F) {
+    return "SHIFT";
+  }
   char buf[2] = {symbol, '\0'};
   return String(buf);
 }
@@ -1656,6 +1659,19 @@ const char *graffitiEngineLabel(GraffitiEngine::Backend engine) {
 }
 
 bool applyGraffitiSymbol(char symbol) {
+  if (symbol == 0x0F) {
+    if (g_graffitiShiftMode == GraffitiShiftMode::Off) {
+      g_graffitiShiftMode = GraffitiShiftMode::OneShot;
+      g_graffitiStatus = "SHIFT 1X";
+    } else if (g_graffitiShiftMode == GraffitiShiftMode::OneShot) {
+      g_graffitiShiftMode = GraffitiShiftMode::CapsLock;
+      g_graffitiStatus = "SHIFT CAPS";
+    } else {
+      g_graffitiShiftMode = GraffitiShiftMode::Off;
+      g_graffitiStatus = "SHIFT OFF";
+    }
+    return true;
+  }
   if (symbol == '\b') {
     if (!g_graffitiText.isEmpty()) {
       g_graffitiText.remove(g_graffitiText.length() - 1);
