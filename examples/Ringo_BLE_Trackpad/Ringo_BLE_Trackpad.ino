@@ -30,6 +30,8 @@ constexpr uint32_t kRejectFlashMs = 70;
 constexpr uint32_t kTouchReleaseTimeoutMs = 120;
 constexpr uint32_t kTouchPollMs = 12;
 constexpr uint32_t kGraffitiTouchPollMs = 12;
+constexpr uint32_t kTouchFaultBackoffBaseMs = 24;
+constexpr uint32_t kTouchFaultBackoffMaxMs = 320;
 constexpr uint32_t kImuPollMs = 8;
 constexpr int32_t kI2cBusHz = 100000;
 constexpr uint32_t kGraffitiImuPollMs = 35;
@@ -232,6 +234,8 @@ int16_t g_graffitiLastDeltaX = 0;
 int16_t g_graffitiLastDeltaY = 0;
 uint16_t g_graffitiLastPressMs = 0;
 bool g_graffitiReadFault = false;
+uint8_t g_touchReadFaultCount = 0;
+uint32_t g_touchBackoffUntilMs = 0;
 bool g_graffitiTapOnlyActive = false;
 bool g_captureNextStrokeArmed = false;
 char g_captureNextLabel[kGraffitiCaptureLabelMaxLen] = {0};
@@ -275,6 +279,7 @@ void serviceKeyboardRelease();
 void serviceArrowRepeat();
 void tapKeyboardKeyUsage(uint8_t usage);
 void updateDisplayBacklight();
+bool readTouchSnapshot(int16_t &finger, int16_t &x, int16_t &y);
 bool loadGyroBiasFromNvs();
 bool saveGyroBiasToNvs();
 bool loadUiConfigFromNvs();
@@ -589,6 +594,36 @@ bool sendKeyboardSymbol(char symbol) {
     return false;
   }
   tapKeyboardUsage(modifier, usage);
+  return true;
+}
+
+bool readTouchSnapshot(int16_t &finger, int16_t &x, int16_t &y) {
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_touchBackoffUntilMs) < 0) {
+    return false;
+  }
+
+  finger = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  x = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+  y = (int16_t)CST816T->IIC_Read_Device_Value(
+      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+
+  if (finger < 0 || x < 0 || y < 0) {
+    g_graffitiReadFault = true;
+    if (g_touchReadFaultCount < 7) {
+      ++g_touchReadFaultCount;
+    }
+    const uint32_t backoff = std::min<uint32_t>(
+        kTouchFaultBackoffMaxMs, kTouchFaultBackoffBaseMs << (g_touchReadFaultCount - 1));
+    g_touchBackoffUntilMs = now + backoff;
+    return false;
+  }
+
+  g_graffitiReadFault = false;
+  g_touchReadFaultCount = 0;
+  g_touchBackoffUntilMs = 0;
   return true;
 }
 
@@ -1659,6 +1694,10 @@ const char *graffitiEngineLabel(GraffitiEngine::Backend engine) {
 }
 
 bool applyGraffitiSymbol(char symbol) {
+  if (g_graffitiOneShotPunct && symbol == '\b') {
+    g_graffitiStatus = "PUNCT OFF";
+    return true;
+  }
   if (symbol == 0x0F) {
     if (g_graffitiShiftMode == GraffitiShiftMode::Off) {
       g_graffitiShiftMode = GraffitiShiftMode::OneShot;
@@ -1907,10 +1946,12 @@ bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t d
 
 void sampleGraffitiExitTapOnly() {
   const uint32_t now = millis();
-  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  int16_t finger = 0;
+  int16_t x = -1;
+  int16_t y = -1;
+  const bool readOk = readTouchSnapshot(finger, x, y);
 
-  if (finger <= 0) {
+  if (!readOk || finger <= 0) {
     if (!g_touchDown) {
       g_touchActive = false;
       return;
@@ -2026,17 +2067,6 @@ void sampleGraffitiExitTapOnly() {
     g_graffitiStatus = "PUNCT 1X";
     return;
   }
-
-  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-  if (x < 0 || y < 0) {
-    g_graffitiReadFault = true;
-    return;
-  }
-
-  g_graffitiReadFault = false;
   g_touchActive = true;
   g_touchX = x;
   g_touchY = y;
@@ -2061,15 +2091,11 @@ void sampleGraffitiTouchState() {
   }
 
   const uint32_t now = millis();
-  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
-  const bool fingerPresent = finger > 0;
-  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-  if (x < 0 || y < 0) {
-    g_graffitiReadFault = true;
+  int16_t finger = 0;
+  int16_t x = -1;
+  int16_t y = -1;
+  const bool readOk = readTouchSnapshot(finger, x, y);
+  if (!readOk) {
     if (g_touchDown &&
         g_graffitiLastCoordMs != 0 &&
         (now - g_graffitiLastCoordMs) > kGraffitiReleaseHoldMs) {
@@ -2082,7 +2108,7 @@ void sampleGraffitiTouchState() {
     }
     return;
   }
-  g_graffitiReadFault = false;
+  const bool fingerPresent = finger > 0;
   const bool coordValid = (x >= 0 && y >= 0);
   const bool coordIdle = coordValid && (x == kCstIdleX) && (y == kCstIdleY);
   const bool coordTouch = coordValid && !coordIdle;
@@ -2666,10 +2692,12 @@ void handleGestureIfAny() {
 
 void sampleTouchState() {
   const uint32_t now = millis();
-  const int16_t finger = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  int16_t finger = 0;
+  int16_t x = -1;
+  int16_t y = -1;
+  const bool readOk = readTouchSnapshot(finger, x, y);
 
-  if (finger <= 0) {
+  if (!readOk || finger <= 0) {
     if (g_touchDown) {
       if (g_leftLockActive) {
         g_tapArmed = false;
@@ -2709,15 +2737,6 @@ void sampleTouchState() {
     g_touchLongActionFired = false;
     g_swipeHandledThisTouch = false;
     g_touchActive = false;
-    return;
-  }
-
-  const int16_t x = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  const int16_t y = (int16_t)CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-
-  if (x < 0 || y < 0) {
     return;
   }
 
@@ -2934,8 +2953,9 @@ void loop() {
 
   if (g_imuReady) {
     const bool airMouseActive = (g_inputMode == InputMode::Mouse) && !g_graffitiTapOnlyActive;
+    const bool graffitiStrokeActive = (g_inputMode == InputMode::Graffiti) && (g_touchDown || g_touchActive);
     const uint32_t imuPollMs = airMouseActive ? kImuPollMs : kGraffitiImuPollMs;
-    if ((now - g_lastImuPollMs) >= imuPollMs) {
+    if (!graffitiStrokeActive && (now - g_lastImuPollMs) >= imuPollMs) {
       g_lastImuPollMs = now;
       if (airMouseActive) {
         updateAirMouse();

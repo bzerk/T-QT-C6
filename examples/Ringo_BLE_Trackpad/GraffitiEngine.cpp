@@ -4,6 +4,10 @@ namespace {
 constexpr uint16_t kMaxEnginePoints = 192;
 constexpr float kMinPointDistanceSq = 1.0f;
 
+bool isSharedNumericControl(const GraffitiPrototypeModelData::PrototypeEntry &prototype) {
+  return (strcmp(prototype.label, "SPACE") == 0) || (strcmp(prototype.label, "BKSP") == 0);
+}
+
 float squaredDistance(const float *lhs, const float *rhs, uint16_t count) {
   float total = 0.0f;
   for (uint16_t i = 0; i < count; ++i) {
@@ -179,16 +183,31 @@ bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) 
   if (!buildFeatureVector(points, count, featureVector)) {
     return false;
   }
+  float lettersFeatureVector[kInputFeatureDim];
+  bool haveLettersFeatureVector = false;
+  if (condition_ == Condition::Numeric) {
+    const Condition saved = condition_;
+    condition_ = Condition::Letters;
+    haveLettersFeatureVector = buildFeatureVector(points, count, lettersFeatureVector);
+    condition_ = saved;
+  }
 
   const GraffitiPrototypeModelData::PrototypeEntry *bestPrototype = nullptr;
   float bestDistance = INFINITY;
   float secondDistance = INFINITY;
   for (uint16_t i = 0; i < GraffitiPrototypeModelData::kPrototypeCount; ++i) {
     const auto &prototype = GraffitiPrototypeModelData::kPrototypes[i];
-    if (prototype.conditionIndex != static_cast<uint8_t>(condition_)) {
+    const bool conditionMatch = (prototype.conditionIndex == static_cast<uint8_t>(condition_));
+    const bool sharedNumericControl =
+        (condition_ == Condition::Numeric) &&
+        (prototype.conditionIndex == static_cast<uint8_t>(Condition::Letters)) &&
+        isSharedNumericControl(prototype) &&
+        haveLettersFeatureVector;
+    if (!conditionMatch && !sharedNumericControl) {
       continue;
     }
-    const float distance = squaredDistance(featureVector, prototype.vector, kInputFeatureDim);
+    const float *candidateVector = sharedNumericControl ? lettersFeatureVector : featureVector;
+    const float distance = squaredDistance(candidateVector, prototype.vector, kInputFeatureDim);
     if (distance < bestDistance) {
       secondDistance = bestDistance;
       bestDistance = distance;
