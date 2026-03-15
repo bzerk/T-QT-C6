@@ -4,8 +4,17 @@ namespace {
 constexpr uint16_t kMaxEnginePoints = 192;
 constexpr float kMinPointDistanceSq = 1.0f;
 
-bool isSharedNumericControl(const GraffitiPrototypeModelData::PrototypeEntry &prototype) {
-  return (strcmp(prototype.label, "SPACE") == 0) || (strcmp(prototype.label, "BKSP") == 0);
+bool isSharedLettersControl(const GraffitiPrototypeModelData::PrototypeEntry &prototype,
+                            GraffitiEngine::Condition activeCondition) {
+  const bool isBksp = (strcmp(prototype.label, "BKSP") == 0);
+  const bool isSpace = (strcmp(prototype.label, "SPACE") == 0);
+  if (activeCondition == GraffitiEngine::Condition::Numeric) {
+    return isBksp || isSpace;
+  }
+  if (activeCondition == GraffitiEngine::Condition::Punct) {
+    return isBksp;
+  }
+  return false;
 }
 
 float squaredDistance(const float *lhs, const float *rhs, uint16_t count) {
@@ -193,7 +202,7 @@ bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) 
   }
   float lettersFeatureVector[kInputFeatureDim];
   bool haveLettersFeatureVector = false;
-  if (condition_ == Condition::Numeric) {
+  if (condition_ == Condition::Numeric || condition_ == Condition::Punct) {
     const Condition saved = condition_;
     condition_ = Condition::Letters;
     haveLettersFeatureVector = buildFeatureVector(points, count, lettersFeatureVector);
@@ -206,15 +215,15 @@ bool GraffitiEngine::classify(const Point *points, uint16_t count, Result &out) 
   for (uint16_t i = 0; i < GraffitiPrototypeModelData::kPrototypeCount; ++i) {
     const auto &prototype = GraffitiPrototypeModelData::kPrototypes[i];
     const bool conditionMatch = (prototype.conditionIndex == static_cast<uint8_t>(condition_));
-    const bool sharedNumericControl =
-        (condition_ == Condition::Numeric) &&
+    const bool sharedLettersControl =
+        (condition_ != Condition::Letters) &&
         (prototype.conditionIndex == static_cast<uint8_t>(Condition::Letters)) &&
-        isSharedNumericControl(prototype) &&
+        isSharedLettersControl(prototype, condition_) &&
         haveLettersFeatureVector;
-    if (!conditionMatch && !sharedNumericControl) {
+    if (!conditionMatch && !sharedLettersControl) {
       continue;
     }
-    const float *candidateVector = sharedNumericControl ? lettersFeatureVector : featureVector;
+    const float *candidateVector = sharedLettersControl ? lettersFeatureVector : featureVector;
     const float distance = squaredDistance(candidateVector, prototype.vector, kInputFeatureDim);
     if (distance < bestDistance) {
       secondDistance = bestDistance;

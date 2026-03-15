@@ -2256,7 +2256,16 @@ void sampleGraffitiTouchState() {
 
   if (tapLike) {
     resetGraffitiTapSwitchState();
-    g_graffitiStatus = "TAP";
+    if (g_graffitiOneShotPunct) {
+      g_graffitiStatus = "PUNCT .";
+      applyGraffitiSymbol('.');
+      consumeGraffitiOneShotModes('.');
+    } else if (g_graffitiGlyphMode != GraffitiGlyphMode::Arrow) {
+      g_graffitiOneShotPunct = true;
+      g_graffitiStatus = "PUNCT 1X";
+    } else {
+      g_graffitiStatus = "TAP";
+    }
     resetGraffitiStrokeState();
     return;
   }

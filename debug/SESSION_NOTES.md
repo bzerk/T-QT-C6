@@ -250,3 +250,15 @@
 - Verified compile with `arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc --libraries libraries --output-dir debug/flash_backups/build_model_proto1 examples/Ringo_BLE_Trackpad`.
 - Verified flash with `tools/flash_ringo_esptool.sh /dev/cu.usbmodem101 /Users/noah/projects/T-QT-C6/debug/flash_backups/build_model_proto1`.
 - Post-flash CDC sanity check returned `recognizer=PROTOTYPE cond=letters`.
+
+## 2026-03-15 pending UI/control design note
+- User wants a more deliberate control-modifier UX to avoid accidental control-sequence sends.
+- Proposed gesture semantics to preserve for future implementation:
+  - Invert + hold, then de-invert, then release: switch between `Mouse` and `Graffiti`.
+  - Invert + single tap + release, then de-invert: arm one-shot `Ctrl` modifier for the next accepted input.
+  - One-shot `Ctrl` should use the same corner-dot concept as punctuation, but blue instead of yellow.
+  - Do not send the ctrl-modified keystroke immediately.
+  - When the ctrl-modified input is recognized, render that candidate glyph large on-screen (about 3x current debug glyph size).
+  - Swipe right confirms the pending ctrl-modified input.
+  - Swipe left rejects/cancels the pending ctrl-modified input.
+- Motivation noted by user: avoid accidental `Ctrl-C` or `Ctrl-B` in terminal/tmux workflows.
