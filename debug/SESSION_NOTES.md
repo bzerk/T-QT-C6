@@ -262,3 +262,12 @@
   - Swipe right confirms the pending ctrl-modified input.
   - Swipe left rejects/cancels the pending ctrl-modified input.
 - Motivation noted by user: avoid accidental `Ctrl-C` or `Ctrl-B` in terminal/tmux workflows.
+
+## 2026-03-16 control patch
+- Inverted command pose now uses deferred actions on de-invert.
+- Hold in inverted pose, then right the device, toggles Mouse/Graffiti.
+- Tap in inverted pose, then right the device, arms one-shot Ctrl.
+- One-shot Ctrl shows a blue dot.
+- After the next accepted glyph, Ctrl does not transmit immediately; it shows a large preview glyph.
+- Swipe right confirms the Ctrl chord; swipe left rejects it.
+- Existing tap-to-punctuation, invert swipe up numeric toggle, invert swipe down arrow toggle, and invert swipe right display toggle remain.

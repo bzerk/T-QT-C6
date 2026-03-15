@@ -139,6 +139,12 @@ enum class GraffitiTraceMode : uint8_t {
   Continuous,
 };
 
+enum class GraffitiCommandPoseAction : uint8_t {
+  None,
+  ToggleMode,
+  ArmCtrl,
+};
+
 volatile bool g_touchInterrupt = false;
 bool g_bleConnected = false;
 bool g_touchActive = false;
@@ -255,6 +261,10 @@ uint32_t g_rejectFlashUntilMs = 0;
 GraffitiGlyphMode g_graffitiGlyphMode = GraffitiGlyphMode::Alpha;
 GraffitiShiftMode g_graffitiShiftMode = GraffitiShiftMode::Off;
 bool g_graffitiOneShotPunct = false;
+bool g_graffitiOneShotCtrl = false;
+bool g_ctrlPreviewActive = false;
+char g_ctrlPreviewSymbol = 0;
+GraffitiCommandPoseAction g_commandPosePendingAction = GraffitiCommandPoseAction::None;
 uint8_t g_arrowHeldUsage = 0;
 uint32_t g_arrowRepeatDueMs = 0;
 uint32_t g_arrowModeEnteredMs = 0;
@@ -288,12 +298,16 @@ void resetStationaryBiasEstimator();
 void serviceAutoGyroBiasCorrection(const ImuSample &sample, float gx_dps, float gy_dps, float gz_dps);
 bool recalibrateGyroBias(bool persistBias);
 void setCommandAck(const String &ack);
+void toggleInputMode();
 String graffitiSymbolLabel(char symbol);
 const char *graffitiEngineLabel(GraffitiEngine::Backend engine);
 bool isGraffitiSwipeDownExit(uint32_t pressDurationMs, int16_t deltaX, int16_t deltaY, uint16_t pointCount);
 bool applyGraffitiSymbol(char symbol);
 const char *graffitiGlyphModeName(GraffitiGlyphMode mode);
 const char *graffitiShiftModeName(GraffitiShiftMode mode);
+bool sendCtrlModifiedSymbol(char symbol);
+void clearCtrlPreview();
+void sampleGraffitiCtrlPreviewTouch();
 
 BLEHIDDevice *g_hid = nullptr;
 BLECharacteristic *g_inputMouse = nullptr;
@@ -597,6 +611,21 @@ bool sendKeyboardSymbol(char symbol) {
   return true;
 }
 
+bool sendCtrlModifiedSymbol(char symbol) {
+  if (symbol == 0x1B) {
+    tapKeyboardUsage(0x01, 0x29);
+    return true;
+  }
+
+  uint8_t modifier = 0;
+  uint8_t usage = 0;
+  if (!mapSymbolToKeyboardUsage(symbol, modifier, usage)) {
+    return false;
+  }
+  tapKeyboardUsage(static_cast<uint8_t>(modifier | 0x01), usage);
+  return true;
+}
+
 bool readTouchSnapshot(int16_t &finger, int16_t &x, int16_t &y) {
   const uint32_t now = millis();
   if (static_cast<int32_t>(now - g_touchBackoffUntilMs) < 0) {
@@ -634,6 +663,11 @@ void tapKeyboardKeyUsage(uint8_t usage) {
 bool sendEscKey() {
   tapKeyboardKeyUsage(0x29);
   return true;
+}
+
+void clearCtrlPreview() {
+  g_ctrlPreviewActive = false;
+  g_ctrlPreviewSymbol = 0;
 }
 
 void setGraffitiGlyphMode(GraffitiGlyphMode mode) {
@@ -1321,6 +1355,23 @@ void updateGraffitiTapOnlyMode() {
     return;
   }
 
+  GraffitiCommandPoseAction exitAction = GraffitiCommandPoseAction::None;
+  if (g_graffitiTapOnlyActive && !nextTapOnly) {
+    if (g_commandPosePendingAction != GraffitiCommandPoseAction::None) {
+      exitAction = g_commandPosePendingAction;
+    } else if (g_touchDown) {
+      const uint32_t now = millis();
+      const uint32_t pressDuration = now - g_touchDownStartMs;
+      const int16_t deltaX = g_touchX - g_touchDownX;
+      const int16_t deltaY = g_touchY - g_touchDownY;
+      if (pressDuration >= kGraffitiCommandLongPressMs &&
+          abs(deltaX) <= kTouchTapMoveThresholdPx &&
+          abs(deltaY) <= kTouchTapMoveThresholdPx) {
+        exitAction = GraffitiCommandPoseAction::ToggleMode;
+      }
+    }
+  }
+
   g_graffitiTapOnlyActive = nextTapOnly;
   resetGraffitiStrokeState();
   resetGraffitiTapSwitchState();
@@ -1338,10 +1389,20 @@ void updateGraffitiTapOnlyMode() {
     g_graffitiStatus = "CMD TAP";
     Serial.printf("[mode] command pose ON (proj=%.2f)\n", projection);
   } else {
-    if (g_inputMode == InputMode::Graffiti) {
+    if (exitAction == GraffitiCommandPoseAction::ToggleMode) {
+      g_graffitiStatus = (g_inputMode == InputMode::Mouse) ? "MODE->GRAF" : "MODE->MOUSE";
+      toggleInputMode();
+    } else if (exitAction == GraffitiCommandPoseAction::ArmCtrl) {
+      g_graffitiOneShotCtrl = true;
+      g_graffitiStatus = "CTRL 1X";
+    } else if (g_inputMode == InputMode::Graffiti) {
       g_graffitiStatus = "READY";
     } else {
       g_graffitiStatus = "IDLE";
+    }
+    g_commandPosePendingAction = GraffitiCommandPoseAction::None;
+    if (g_inputMode == InputMode::Graffiti) {
+      resetGraffitiStrokeState();
     }
     Serial.printf("[mode] command pose OFF (proj=%.2f)\n", projection);
   }
@@ -1370,6 +1431,9 @@ void resetInputTransientState() {
   g_arrowHeldUsage = 0;
   resetCompletedGraffitiQueue();
   g_keyboardReleasePending = false;
+  g_ctrlPreviewActive = false;
+  g_ctrlPreviewSymbol = 0;
+  g_commandPosePendingAction = GraffitiCommandPoseAction::None;
   resetGraffitiTapSwitchState();
   resetGraffitiStrokeState();
 }
@@ -1385,6 +1449,7 @@ void setInputMode(InputMode mode) {
     setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
     g_graffitiShiftMode = GraffitiShiftMode::Off;
     g_graffitiOneShotPunct = false;
+    g_graffitiOneShotCtrl = false;
     g_graffitiStatus = "READY";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
@@ -1395,6 +1460,7 @@ void setInputMode(InputMode mode) {
     setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
     g_graffitiShiftMode = GraffitiShiftMode::Off;
     g_graffitiOneShotPunct = false;
+    g_graffitiOneShotCtrl = false;
     g_graffitiStatus = "IDLE";
     g_graffitiLastMatch = "NONE";
     g_graffitiLastScore = 0.0f;
@@ -1915,12 +1981,24 @@ void serviceCompletedGraffitiQueue() {
   if (result.accepted) {
     g_graffitiStatus = "ACCEPT";
     bool keySent = false;
-    if (resolvedSymbol == 0x1B) {
+    if (g_graffitiOneShotCtrl && resolvedSymbol != 0x0F) {
+      g_ctrlPreviewActive = true;
+      g_ctrlPreviewSymbol = resolvedSymbol;
+      g_graffitiOneShotCtrl = false;
+      g_graffitiStatus = "CTRL ?";
+      consumeGraffitiOneShotModes(resolvedSymbol);
+    } else if (resolvedSymbol == 0x1B) {
       keySent = sendEscKey();
     } else {
       keySent = applyGraffitiSymbol(resolvedSymbol);
+      if (resolvedSymbol == 0x0F) {
+        // Keep one-shot ctrl armed until a real symbol is selected.
+        g_graffitiStatus = "SHIFT";
+      }
     }
-    consumeGraffitiOneShotModes(resolvedSymbol);
+    if (!(g_ctrlPreviewActive && g_ctrlPreviewSymbol == resolvedSymbol)) {
+      consumeGraffitiOneShotModes(resolvedSymbol);
+    }
     Serial.printf("[graffiti] ACCEPT %s score=%.3f thr=%.3f margin=%.3f dist=%.2f eng=%s tok=%u seq=%s infer_us=%lu q=%u kbd=%s mode=%s shift=%s\n",
                   g_graffitiLastMatch.c_str(), g_graffitiLastScore,
                   g_graffitiEngine.acceptConfidence(), result.rawScore,
@@ -2049,15 +2127,8 @@ void sampleGraffitiExitTapOnly() {
     }
 
     if (longPress) {
-      if (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) {
-        setGraffitiGlyphMode(GraffitiGlyphMode::Alpha);
-        g_graffitiStatus = "ARROW OFF";
-      } else {
-        setGraffitiGlyphMode(GraffitiGlyphMode::Arrow);
-        g_graffitiShiftMode = GraffitiShiftMode::Off;
-        g_graffitiOneShotPunct = false;
-        g_graffitiStatus = "ARROW ON";
-      }
+      g_commandPosePendingAction = GraffitiCommandPoseAction::ToggleMode;
+      g_graffitiStatus = "MODE ARM";
       resetGraffitiTapSwitchState();
       return;
     }
@@ -2068,26 +2139,8 @@ void sampleGraffitiExitTapOnly() {
       return;
     }
 
-    if (g_graffitiTapArmed &&
-        (now - g_graffitiTapArmedMs) <= kModeExitDoubleTapWindowMs) {
-      const int16_t sepX = abs(g_touchDownX - g_graffitiTapAnchorX);
-      const int16_t sepY = abs(g_touchDownY - g_graffitiTapAnchorY);
-      if (sepX <= kModeExitTapSeparationPx && sepY <= kModeExitTapSeparationPx) {
-        const bool toGraffiti = (g_inputMode == InputMode::Mouse);
-        g_graffitiStatus = toGraffiti ? "MODE->GRAF" : "MODE->MOUSE";
-        g_graffitiOneShotPunct = false;
-        resetGraffitiTapSwitchState();
-        toggleInputMode();
-        return;
-      }
-    }
-
-    g_graffitiOneShotPunct = true;
-    g_graffitiTapArmed = true;
-    g_graffitiTapArmedMs = now;
-    g_graffitiTapAnchorX = g_touchDownX;
-    g_graffitiTapAnchorY = g_touchDownY;
-    g_graffitiStatus = "PUNCT 1X";
+    g_commandPosePendingAction = GraffitiCommandPoseAction::ArmCtrl;
+    g_graffitiStatus = "CTRL ARM";
     return;
   }
   g_touchActive = true;
@@ -2107,7 +2160,68 @@ void sampleGraffitiExitTapOnly() {
   }
 }
 
+void sampleGraffitiCtrlPreviewTouch() {
+  const uint32_t now = millis();
+  int16_t finger = 0;
+  int16_t x = -1;
+  int16_t y = -1;
+  const bool readOk = readTouchSnapshot(finger, x, y);
+
+  if (!readOk || finger <= 0) {
+    if (!g_touchDown) {
+      g_touchActive = false;
+      return;
+    }
+
+    const uint32_t pressDuration = now - g_touchDownStartMs;
+    const int16_t deltaX = g_touchX - g_touchDownX;
+    const int16_t deltaY = g_touchY - g_touchDownY;
+    const bool swipeRight = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                             deltaX >= kGraffitiCommandSwipeMinDyPx &&
+                             abs(deltaY) <= kGraffitiCommandSwipeMaxDxPx);
+    const bool swipeLeft = (pressDuration <= kGraffitiExitSwipeMaxDurationMs &&
+                            deltaX <= -kGraffitiCommandSwipeMinDyPx &&
+                            abs(deltaY) <= kGraffitiCommandSwipeMaxDxPx);
+
+    g_touchDown = false;
+    g_touchActive = false;
+    g_graffitiLastDeltaX = deltaX;
+    g_graffitiLastDeltaY = deltaY;
+    g_graffitiLastPressMs = static_cast<uint16_t>(std::min<uint32_t>(65535, pressDuration));
+
+    if (swipeRight) {
+      const bool sent = sendCtrlModifiedSymbol(g_ctrlPreviewSymbol);
+      g_graffitiStatus = sent ? "CTRL OK" : "CTRL SKIP";
+      clearCtrlPreview();
+      return;
+    }
+    if (swipeLeft) {
+      g_graffitiStatus = "CTRL NO";
+      clearCtrlPreview();
+      return;
+    }
+    g_graffitiStatus = "CTRL ?";
+    return;
+  }
+
+  g_touchActive = true;
+  g_touchX = x;
+  g_touchY = y;
+  g_lastTouchEventMs = now;
+
+  if (!g_touchDown) {
+    g_touchDown = true;
+    g_touchDownStartMs = now;
+    g_touchDownX = x;
+    g_touchDownY = y;
+  }
+}
+
 void sampleGraffitiTouchState() {
+  if (g_ctrlPreviewActive) {
+    sampleGraffitiCtrlPreviewTouch();
+    return;
+  }
   if (g_graffitiTapOnlyActive) {
     sampleGraffitiExitTapOnly();
     return;
@@ -2607,7 +2721,8 @@ void renderStatus(bool force) {
   const bool rejectFlashActive = static_cast<int32_t>(now - g_rejectFlashUntilMs) < 0;
   const bool overlayActive =
       (g_graffitiGlyphMode == GraffitiGlyphMode::Arrow) ||
-      (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct || rejectFlashActive;
+      (g_graffitiShiftMode != GraffitiShiftMode::Off) || g_graffitiOneShotPunct ||
+      g_graffitiOneShotCtrl || g_ctrlPreviewActive || rejectFlashActive;
   if (!g_displayEnabled && !overlayActive) {
     return;
   }
@@ -2648,6 +2763,22 @@ void renderStatus(bool force) {
     }
     if (g_graffitiOneShotPunct) {
       gfx->fillCircle(LCD_WIDTH - 8 - 7, 8 + 7, 7, YELLOW);
+    }
+    if (g_graffitiOneShotCtrl || g_ctrlPreviewActive) {
+      gfx->fillCircle(8 + 7, 8 + 7, 7, BLUE);
+    }
+    if (g_ctrlPreviewActive) {
+      const String preview = graffitiSymbolLabel(g_ctrlPreviewSymbol);
+      const uint8_t textSize = (preview.length() <= 1) ? 3 : 2;
+      gfx->setTextColor(WHITE, BLACK);
+      gfx->setTextSize(textSize);
+      const int16_t charW = 6 * textSize;
+      const int16_t textW = preview.length() * charW;
+      const int16_t textX = std::max<int16_t>(0, (LCD_WIDTH - textW) / 2);
+      const int16_t textY = std::max<int16_t>(16, (LCD_HEIGHT / 2) - (4 * textSize));
+      gfx->setCursor(textX, textY);
+      gfx->print(preview);
+      gfx->setTextSize(1);
     }
     g_statusFrameDrawn = false;
     return;
@@ -2693,6 +2824,26 @@ void renderStatus(bool force) {
              graffitiShiftModeName(g_graffitiShiftMode), g_graffitiOneShotPunct ? 'Y' : 'N');
     drawStatusLine(7, 104, String(buf), GREEN, force);
     drawStatusLine(8, 114, String("Cmd:") + textTail(g_lastCmdAck, 16), YELLOW, force);
+  }
+
+  if (g_graffitiOneShotCtrl || g_ctrlPreviewActive) {
+    gfx->fillCircle(8 + 7, 8 + 7, 7, BLUE);
+  }
+  if (g_graffitiOneShotPunct) {
+    gfx->fillCircle(LCD_WIDTH - 8 - 7, 8 + 7, 7, YELLOW);
+  }
+  if (g_ctrlPreviewActive) {
+    const String preview = graffitiSymbolLabel(g_ctrlPreviewSymbol);
+    const uint8_t textSize = (preview.length() <= 1) ? 3 : 2;
+    gfx->setTextColor(WHITE, BLACK);
+    gfx->setTextSize(textSize);
+    const int16_t charW = 6 * textSize;
+    const int16_t textW = preview.length() * charW;
+    const int16_t textX = std::max<int16_t>(0, (LCD_WIDTH - textW) / 2);
+    const int16_t textY = std::max<int16_t>(18, (LCD_HEIGHT / 2) - (4 * textSize));
+    gfx->setCursor(textX, textY);
+    gfx->print(preview);
+    gfx->setTextSize(1);
   }
 }
 
