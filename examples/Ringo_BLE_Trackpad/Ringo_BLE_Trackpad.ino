@@ -726,7 +726,7 @@ void consumeGraffitiOneShotModes(char symbol) {
   if (g_graffitiOneShotPunct) {
     g_graffitiOneShotPunct = false;
   }
-  if (g_graffitiShiftMode == GraffitiShiftMode::OneShot && symbol >= 'a' && symbol <= 'z') {
+  if (g_graffitiShiftMode == GraffitiShiftMode::OneShot && symbol != 0x0F) {
     g_graffitiShiftMode = GraffitiShiftMode::Off;
   }
 }
