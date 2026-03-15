@@ -242,22 +242,27 @@ def parse_script_targets(text: str) -> list[PromptSpec]:
     stripped = text.strip()
     if not stripped:
         return []
-    parts = [item.strip() for item in re.split(r"[,\s]+", stripped) if item.strip()]
+    bracketed_tokens = re.findall(r"\[([^\]]+)\]", stripped)
+    if bracketed_tokens:
+        parts = [item.strip() for item in bracketed_tokens if item.strip()]
+    else:
+      parts = [item.strip() for item in re.split(r"[,\s]+", stripped) if item.strip()]
     if not parts:
         parts = [stripped]
 
     prompts: list[PromptSpec] = []
     for part in parts:
         normalized = normalize_target_token(part)
+        condition = infer_condition(normalized)
+        if condition is not None:
+            prompts.append(PromptSpec(normalized, condition))
+            continue
         if len(part) > 1 and part.isalpha() and normalized not in PUNCT_SET:
             prompts.extend(PromptSpec(ch, "letters") for ch in part.lower())
             continue
         if len(part) > 1 and part.isdigit():
             prompts.extend(PromptSpec(ch, "numeric") for ch in part)
             continue
-        condition = infer_condition(normalized)
-        if condition is not None:
-            prompts.append(PromptSpec(normalized, condition))
     return prompts
 
 
