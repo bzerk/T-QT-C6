@@ -1346,6 +1346,13 @@ float graffitiInvertProjection() {
 }
 
 void updateGraffitiTapOnlyMode() {
+  // Once a command-pose touch begins, hold the pose state until release.
+  // This avoids IMU/touch contention and prevents de-inverting mid-touch from
+  // collapsing the gesture path before release handling runs.
+  if (g_graffitiTapOnlyActive && (g_touchDown || g_touchActive)) {
+    return;
+  }
+
   const float projection = graffitiInvertProjection();
   const bool nextTapOnly =
       g_graffitiTapOnlyActive ? (projection <= kGraffitiInvertExitThreshold)
@@ -3136,9 +3143,10 @@ void loop() {
 
   if (g_imuReady) {
     const bool airMouseActive = (g_inputMode == InputMode::Mouse) && !g_graffitiTapOnlyActive;
+    const bool commandPoseTouchActive = g_graffitiTapOnlyActive && (g_touchDown || g_touchActive);
     const bool graffitiStrokeActive = (g_inputMode == InputMode::Graffiti) && (g_touchDown || g_touchActive);
     const uint32_t imuPollMs = airMouseActive ? kImuPollMs : kGraffitiImuPollMs;
-    if (!graffitiStrokeActive && (now - g_lastImuPollMs) >= imuPollMs) {
+    if (!graffitiStrokeActive && !commandPoseTouchActive && (now - g_lastImuPollMs) >= imuPollMs) {
       g_lastImuPollMs = now;
       if (airMouseActive) {
         updateAirMouse();
